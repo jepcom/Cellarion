@@ -69,7 +69,8 @@ back to `0` and redeploy. DEV-60 must verify the refusal from outside Theo befor
 public exposure and coordinate the role prerequisite with DEV-64/JB.
 
 The upstream `1.274.0` backend image does not contain this fork patch, so Compose
-builds `backend` from this repository's `backend/` directory (tagged
+builds `backend` from this repository's `backend/` directory (context `./backend`,
+resolved from the repo root because Coolify passes `--project-directory`; tagged
 `cellarion-backend:1.274.0-jb`). Frontend and rembg stay on the upstream images.
 
 The anonymous MCP switch is `mcp.publicEnabled=0` in the
