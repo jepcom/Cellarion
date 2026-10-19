@@ -1,6 +1,7 @@
 # Cellarion — migration into the Devshop (2026-10-19)
 
-**Status: FROZEN. Do not change the running stack in `~/services/cellarion/`.**
+**Status: COMPLETE (2026-10-19 night). The Coolify stack at `https://wines.exerun.com` is the
+only Cellarion; the legacy tailnet stack is decommissioned. See "Final shape" at the end.**
 
 All Cellarion work is now owned by the multica **Devshop** project **Cellarion**
 (`a899c4a6-9586-4969-9646-61abcd3e9612`, workspace `3413ef11-0180-41c4-9bb3-0b8f65915bd5`).
@@ -143,3 +144,38 @@ The legacy tailnet-only stack is gone; the Coolify application `cellarion`
   - `legacy-stack-2026-10-19-1634/` — last mongodump of the legacy stack (from DEV-62).
 - Then removed `~/services/cellarion/` and the volumes `cellarion_mongo-data`, `cellarion_meili-data`.
 - This file in the repo (`deploy/MIGRATION.md`) is now the record; the on-host copy no longer exists.
+
+## Final shape (pipeline complete, 2026-10-19 ~22:00 CEST)
+
+Every step above ran as a Devshop issue, executed by DevOps Agent and independently
+verified by Cleo before the next step started.
+
+- **Live**: Coolify application `cellarion` (uuid `spuypiijq4qrcd0mzkfpm0qd`),
+  `https://wines.exerun.com`, Let's Encrypt cert valid to 2027-01-17. Compose source:
+  this repo, branch `jb`, `deploy/docker-compose.yml`. Backend image
+  `cellarion-backend:1.274.0-jb` (built from source — upstream's 1.274.0 image predates
+  the registration-lockdown patch). Upstream v1.274.0 is current; no bump pending.
+- **Lockdown (standing invariants, checked by the monitor)**: `/` → 200,
+  `POST /api/auth/register` → 403, `/api/mcp` unauthenticated → 401,
+  `POST /api/auth/demo-login` → 429. 1 user (`jesper`), registration closed,
+  `mcp.publicEnabled=0`, `demo.globalMax=0`.
+- **Backups**: `cellarion-backup.timer` 03:45 → `~/backups/cellarion/` (mongodump by
+  Coolify-uuid container lookup + uploads volume), off-site restic 04:30. Restore drill
+  green (DEV-62). Legacy archives listed in the decommission record above.
+- **Monitoring (DEV-68)**: `~/ops/bin/cellarion-check`, systemd user timer every 15 min.
+  Three checks (site 200, register 403, newest backup < 36 h); alerts on state change
+  after two consecutive failures; silent while healthy.
+- **Intake (DEV-70)**: `~/ops/bin/cellarion` CLI (token `~/.config/cellarion/token`,
+  600, read+write+consume via `/api/mcp`). Preview → apply → `undo-last [--batch]`.
+  Protocol: `deploy/INTAKE.md`. Cleo skill `cellar-intake` handles shelf photos
+  from Telegram.
+- **Bulk import (DEV-72)**: plain/Vivino/CellarTracker CSV import works with **no AI
+  key** (rows need Producer + Wine + Country + Type). Receipts and label scan need a
+  paid key — not enabled (DEV-74 is JB's call). Column shapes: `deploy/INTAKE.md`.
+- **Pairing (DEV-73)**: `cellarion cellar` returns the drinkable cellar as compact JSON.
+  Chef and Ray read it through the read-only MCP tool `get_cellar`
+  (`~/ops/bin/cellar-read-mcp`, read-only token `~/.config/cellarion/token-read`).
+  Rules note: Basic Memory `projects/wine-cellar/Wine pairing from the cellar - get_cellar`.
+- **Open, waiting for JB**: delete scratch repo `jepcom/devshop-probe`; change the
+  generated Cellarion password; DEV-71 and DEV-74 decisions; Chef's model auth
+  (`openai/gpt-5.6-sol` has no usable profile — re-auth OpenAI or give Chef a fallback).
