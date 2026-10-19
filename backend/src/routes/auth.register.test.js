@@ -69,7 +69,16 @@ beforeAll((done) => {
   server.listen(0, () => { baseUrl = `http://127.0.0.1:${server.address().port}`; done(); });
 });
 afterAll((done) => { server.closeAllConnections(); server.close(done); });
-beforeEach(() => { jest.clearAllMocks(); mockCreated.length = 0; });
+const originalAllowRegistration = process.env.ALLOW_REGISTRATION;
+afterEach(() => {
+  if (originalAllowRegistration === undefined) delete process.env.ALLOW_REGISTRATION;
+  else process.env.ALLOW_REGISTRATION = originalAllowRegistration;
+});
+beforeEach(() => {
+  jest.clearAllMocks();
+  mockCreated.length = 0;
+  process.env.ALLOW_REGISTRATION = '1';
+});
 
 const register = (body) => fetch(`${baseUrl}/api/auth/register`, {
   method: 'POST',
@@ -118,4 +127,20 @@ test('a taken username or email answers one code for both', async () => {
   expect(res.status).toBe(400);
   expect(await res.json()).toMatchObject({ code: 'REGISTRATION_REJECTED' });
   expect(mockCreated).toHaveLength(0);
+});
+
+// Every closed response precedes validation, account lookups and side effects.
+test.each([undefined, '0', '', 'true', '2'])('registration is closed for ALLOW_REGISTRATION=%s', async (value) => {
+  if (value === undefined) delete process.env.ALLOW_REGISTRATION;
+  else process.env.ALLOW_REGISTRATION = value;
+  User.findOne.mockResolvedValue({ _id: 'existing-user' });
+
+  for (const body of [{}, { email: 'unknown@example.com' }, { email: null, username: null }]) {
+    const res = await register(body);
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'Registration is closed' });
+  }
+  expect(User.findOne).not.toHaveBeenCalled();
+  expect(mockCreated).toHaveLength(0);
+  expect(issueTokens).not.toHaveBeenCalled();
 });

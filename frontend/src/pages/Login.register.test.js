@@ -111,3 +111,15 @@ test('arriving from a verified email link says what is left to do', () => {
   render(<Login />);
   expect(screen.getByRole('status')).toHaveTextContent(/email is verified/i);
 });
+
+test('closed registration displays the server error and keeps the form available', async () => {
+  routerLocation.search = '?mode=register';
+  registerMock.mockResolvedValue({ success: false, error: 'Registration is closed' });
+  render(<Login />);
+  fillRegister();
+  submit();
+  expect(await screen.findByRole('alert')).toHaveTextContent('Registration is closed');
+  expect(navigateMock).not.toHaveBeenCalled();
+  expect(screen.getByLabelText('auth.emailLabel')).toHaveValue('anna@example.com');
+  expect(document.querySelector('form button[type="submit"]')).toBeEnabled();
+});
