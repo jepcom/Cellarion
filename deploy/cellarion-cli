@@ -23,6 +23,14 @@ appears on a command line or in output. Every command prints JSON.
   cellarion undo-last --batch                 undo everything this CLI did since (and incl.) the last
                                               `add --apply` — the photo, placements, then the batch
   cellarion journal                           what this CLI wrote, newest last (local record)
+  cellarion cellar [--cellar ID] [--all]      READ ONLY (DEV-73): the drinkable cellar in one call — wines
+                                              in stock grouped by wine+vintage with quantity, rack position
+                                              and drink window; `window` is in|approaching|past|unknown
+                                              (--all adds not_yet and reserved bottles). Chef/Ray/Cleo use
+                                              this for food pairing, with the read-only token.
+
+Token file: $CELLARION_TOKEN_FILE overrides the default. ~/.config/cellarion/token-read holds a token
+with scope `read` only — every write verb fails on it server-side.
 
 Exit codes: 0 ok, 1 API/tool error, 2 usage, 3 token missing/unsafe.
 """
@@ -161,6 +169,90 @@ def expand(items):
     return flat
 
 
+NEAR_YEARS = 2  # "approaching": window opens within this many years (same horizon as Cellarion's own)
+
+
+def window_of(m, year):
+    """Classify a search_bottles `maturity` block against the current year."""
+    f, t = (m or {}).get("drink_from"), (m or {}).get("drink_to")
+    if f is None and t is None:
+        return {"window": "unknown", "in_window": None, "drink_window": None}
+    if f is not None and year < f:
+        state = "approaching" if f - year <= NEAR_YEARS else "not_yet"
+        return {"window": state, "in_window": False, "drink_window": f"{f or ''}–{t or ''}", "opens_in_years": f - year}
+    if t is not None and year > t:
+        return {"window": "past", "in_window": False, "drink_window": f"{f or ''}–{t}", "ended_years_ago": year - t}
+    return {"window": "in", "in_window": True, "drink_window": f"{f or ''}–{t or ''}"}
+
+
+def all_pages(args):
+    rows, off = [], 0
+    while True:
+        r = mcp("search_bottles", {**args, "limit": 50, "offset": off})
+        rows += r.get("data", [])
+        off += 50
+        if off >= r.get("page", {}).get("total", 0):
+            return rows
+
+
+def cellar_view(only_cellar=None, show_all=False):
+    year = time.localtime().tm_year
+    cellars = [c for c in mcp("list_cellars").get("data", []) if not only_cellar or c["cellar_id"] == only_cellar]
+    where, lots, reserved_ids = {}, {}, set()
+    counts = {"in_stock": 0, "listed": 0, "reserved": 0, "not_yet": 0}
+    for c in cellars:
+        for rack in mcp("list_racks", {"cellar_id": c["cellar_id"]}).get("data", []):
+            full = mcp("get_rack", {"rack_id": rack["rack_id"]}).get("data", {})
+            for s in full.get("slots", []):
+                pos = s["position"]
+                loc = " / ".join(x for x in (full.get("group"), full.get("name")) if x) + f" #{pos}"
+                if full.get("type", "grid") == "grid" and full.get("cols"):
+                    loc += f" (row {(pos - 1) // full['cols'] + 1}, col {(pos - 1) % full['cols'] + 1})"
+                where[s["bottle_id"]] = (full.get("name") or "", pos, loc)
+        if c.get("active_bottles", 1) == 0:
+            continue
+        reserved_ids |= {b["bottle_id"] for b in all_pages({"cellar_id": c["cellar_id"], "reserved": "only"})}
+        for b in all_pages({"cellar_id": c["cellar_id"], "status": "active"}):
+            counts["in_stock"] += 1
+            w, m = b.get("wine") or {}, b.get("maturity") or {}
+            win = window_of(m, year)
+            reserved = b["bottle_id"] in reserved_ids
+            counts["reserved"] += reserved
+            counts["not_yet"] += win["window"] == "not_yet"
+            if not show_all and (reserved or win["window"] == "not_yet"):
+                continue
+            key = (c["cellar_id"], w.get("producer"), w.get("name"), b.get("vintage"), win["drink_window"], reserved)
+            lot = lots.get(key)
+            if not lot:
+                lot = lots[key] = {
+                    "producer": w.get("producer"), "wine": w.get("name"), "vintage": b.get("vintage"),
+                    "type": w.get("type"), "grapes": w.get("grapes") or [], "region": w.get("region"),
+                    "country": w.get("country"), "quantity": 0, **win, "maturity": m.get("status"),
+                    "window_source": m.get("source"), "rating": b.get("rating"), "cellar": c["name"],
+                    "locations": [], "unplaced": 0, "bottle_ids": []}
+                if reserved:
+                    lot["reserved"] = True
+            lot["quantity"] += 1
+            lot["bottle_ids"].append(b["bottle_id"])
+            if b["bottle_id"] in where:
+                lot["locations"].append(where[b["bottle_id"]])
+            else:
+                lot["unplaced"] += 1
+    for lot in lots.values():
+        lot["locations"] = [loc for _, _, loc in sorted(lot["locations"])]
+    rank = {"in": 0, "past": 1, "approaching": 2, "unknown": 3, "not_yet": 4}
+    wines = sorted(lots.values(), key=lambda l: (rank[l["window"]], l.get("reserved", False),
+                                                  (l["drink_window"] or "~").split("–")[-1] or "~"))
+    counts["listed"] = sum(l["quantity"] for l in wines)
+    res = {"ok": True, "as_of": time.strftime("%Y-%m-%d"), "cellars": [c["name"] for c in cellars],
+           "counts": counts, "wines": wines}
+    if not counts["in_stock"]:
+        res["note"] = "nothing in stock yet — the cellar is empty / intet på lager endnu"
+    elif not wines:
+        res["note"] = "bottles in stock, but none inside or near their drink window (try --all)"
+    return res
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
@@ -276,6 +368,13 @@ def main(argv):
             rows.pop()
             journal_write(rows)
         out({"ok": True, "undone_steps": done})
+
+    if cmd == "cellar":
+        show_all = opt(argv, "--all", flag=True)
+        only = opt(argv, "--cellar")
+        if argv:
+            die("usage: cellarion cellar [--cellar ID] [--all]", 2)
+        out(cellar_view(only, show_all))
 
     if cmd == "journal":
         out(journal_read())

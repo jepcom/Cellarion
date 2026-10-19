@@ -181,3 +181,16 @@ Detected by `iWine`/`Barcode`, or by `Wine` + `Vintage` + `Locale`/`Bin`. Read: 
 - **Cellar Chat**: needs both an Anthropic key (default `claude-haiku-4-5`, $1/$5 per M tokens,
   about $0.01 per question) **and** an embeddings key (`VOYAGE_API_KEY`, `voyage-4-large`). Embedding
   a cellar of a few hundred wines costs cents.
+
+## Reading the cellar for food pairing (DEV-73)
+
+`cellarion cellar [--cellar ID] [--all]` returns the drinkable cellar in one call: wines in stock grouped
+by wine+vintage with quantity, rack slot (`Kælder / Reol A #7 (row 2, col 3)`), `drink_window` and
+`window` = `in | approaching | past | unknown` (`--all` adds `not_yet` and reserved bottles).
+`counts.in_stock` = 0 means the cellar is empty. Pagination is handled inside the command.
+
+Chef and Ray have no shell, so they get it as the MCP tool `get_cellar` from `deploy/cellar-read-mcp`
+(installed as `~/ops/bin/cellar-read-mcp`, registered as `mcp.servers.cellar` in `~/.openclaw/openclaw.json`).
+It always uses `~/.config/cellarion/token-read`, a personal API token with scope `read` only — Cellarion
+does not even list write tools for it. Pairing rules for the agents live in Basic Memory:
+`projects/wine-cellar/Wine pairing from the cellar - get_cellar`.
