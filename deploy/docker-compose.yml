@@ -58,9 +58,10 @@ services:
     labels:
       traefik.enable: "false"
     # Built from this fork's backend/ (1.274.0 + DEV-67 registration patch);
-    # the upstream ghcr image does not contain the patch.
+    # the upstream ghcr image does not contain the patch. Coolify runs Compose
+    # with --project-directory at the repo root, so the context is root-relative.
     build:
-      context: ../backend
+      context: ./backend
     image: cellarion-backend:1.274.0-jb
     stop_grace_period: 15s
     init: true

@@ -14,7 +14,8 @@ ENV.update(JWT_SECRET='public-test-placeholder-not-a-secret',
 
 def render(env):
     return subprocess.run(
-        ['docker', 'compose', '--env-file', '/dev/null', '-f', str(COMPOSE),
+        ['docker', 'compose', '--env-file', '/dev/null',
+         '--project-directory', str(COMPOSE.parent.parent), '-f', str(COMPOSE),
          'config', '--format', 'json'],
         env=env, capture_output=True, text=True, check=False)
 
