@@ -127,3 +127,19 @@ issues in the project.
   answered by JB.
 - Do not grant the `admin` role, change passwords, or write to Mongo without JB's explicit go.
 - `PLAN.md` in this directory is historical. Where it conflicts with this file, this file wins.
+
+## Decommission record (DEV-63, 2026-10-19)
+
+The legacy tailnet-only stack is gone; the Coolify application `cellarion`
+(uuid `spuypiijq4qrcd0mzkfpm0qd`) at `https://wines.exerun.com` is the only Cellarion.
+
+- Precondition: DEV-62 restore drill green (80/80 collections, `siteconfigs` incl. `rateLimits`).
+- `tailscale serve --https=8445 off` — `https://theo.tail937cbc.ts.net:8445` no longer served.
+- `docker compose down` in `~/services/cellarion/` (containers + network removed).
+- Archives in `~/backups/cellarion/` (mode 600, contain secrets):
+  - `legacy-stack-2026-10-19.tar.gz` — the whole stack dir incl. `.env`, compose, PLAN.md, this file.
+  - `legacy-volume-mongo-data-2026-10-19.tar.gz`, `legacy-volume-meili-data-2026-10-19.tar.gz` —
+    raw contents of the old named volumes, taken after the stack was stopped.
+  - `legacy-stack-2026-10-19-1634/` — last mongodump of the legacy stack (from DEV-62).
+- Then removed `~/services/cellarion/` and the volumes `cellarion_mongo-data`, `cellarion_meili-data`.
+- This file in the repo (`deploy/MIGRATION.md`) is now the record; the on-host copy no longer exists.
