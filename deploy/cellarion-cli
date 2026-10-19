@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""cellarion — Cellarion wine cellar (https://wines.exerun.com) for Cleo, agents and JB (DEV-70).
+
+Talks to Cellarion's MCP endpoint with a personal API token (scopes read+write+consume). The token
+is read from ~/.config/cellarion/token (must be mode 600) and only ever sent as a header; it never
+appears on a command line or in output. Every command prints JSON.
+
+  cellarion ping                              token works? (whoami + token scopes)
+  cellarion list-cellars                      cellars: id, name, bottle count
+  cellarion create-cellar <name>              new cellar (only if JB has none yet; undoable)
+  cellarion racks <cellar_id>                 racks in a cellar: id, name, layout, free/used slots
+  cellarion search [query] [--cellar ID] [--vintage V] [--status active|consumed|on_order|all] [--limit N]
+  cellarion resolve --name N [--producer P] [--country C] [--type T] [--vintage V] [--region R]
+                                              registry lookup before adding (creates nothing)
+  cellarion add --cellar ID <items.json|->    PREVIEW a batch (nothing written). Items: list of
+                                              {wine_id | new_wine{...}, vintage, quantity, drink_from,
+                                               drink_to, price, currency, notes, confirm_new_wine}
+                                              quantity n expands to n bottles; max 24 bottles/batch.
+  cellarion add --apply <preview_id>          write the previewed batch (one undo unit)
+  cellarion photo <image> (--bottle ID | --wine ID) [--label-only]   attach the shelf/label photo
+  cellarion place <rack_id> <position> <bottle_id>                   put a bottle in a rack slot
+  cellarion undo-last                         undo the newest MCP change on the account
+  cellarion undo-last --batch                 undo everything this CLI did since (and incl.) the last
+                                              `add --apply` — the photo, placements, then the batch
+  cellarion journal                           what this CLI wrote, newest last (local record)
+
+Exit codes: 0 ok, 1 API/tool error, 2 usage, 3 token missing/unsafe.
+"""
+import base64
+import json
+import os
+import stat
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+BASE = os.environ.get("CELLARION_URL", "https://wines.exerun.com").rstrip("/")
+TOKEN_FILE = Path(os.environ.get("CELLARION_TOKEN_FILE", Path.home() / ".config/cellarion/token"))
+STATE = Path(os.environ.get("CELLARION_STATE_DIR", Path.home() / ".local/state/cellarion"))
+JOURNAL = STATE / "journal.jsonl"
+MAX_BATCH = 24
+
+
+def out(obj, code=0):
+    print(json.dumps(obj, indent=2, ensure_ascii=False, default=str))
+    sys.exit(code)
+
+
+def die(msg, code=1, **extra):
+    print(json.dumps({"ok": False, "error": msg, **extra}, indent=2, ensure_ascii=False), file=sys.stderr)
+    sys.exit(code)
+
+
+def token():
+    try:
+        st = TOKEN_FILE.stat()
+    except FileNotFoundError:
+        die(f"no token file {TOKEN_FILE} — create a personal API token in Cellarion and save it there (mode 600)", 3)
+    if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        die(f"{TOKEN_FILE} is readable by others (mode {oct(st.st_mode & 0o777)}) — chmod 600 it; refusing to run", 3)
+    if st.st_uid != os.getuid():
+        die(f"{TOKEN_FILE} is not owned by this user; refusing to run", 3)
+    t = TOKEN_FILE.read_text().strip()
+    if not t.startswith("cel_"):
+        die(f"{TOKEN_FILE} does not hold a Cellarion API token (cel_…)", 3)
+    return t
+
+
+_rpc_id = 0
+
+
+def mcp(tool, args=None):
+    """Stateless MCP tools/call. Returns the tool's parsed {summary, data, ...}; dies on any error."""
+    global _rpc_id
+    _rpc_id += 1
+    body = {"jsonrpc": "2.0", "id": _rpc_id, "method": "tools/call", "params": {"name": tool, "arguments": args or {}}}
+    req = urllib.request.Request(
+        BASE + "/api/mcp", method="POST", data=json.dumps(body).encode(),
+        headers={
+            "Authorization": "Bearer " + token(),
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "User-Agent": "cellarion-cli/1 (theo ~/ops/bin/cellarion)",
+        })
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            raw = r.read().decode()
+            ctype = r.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as e:
+        die(f"Cellarion answered HTTP {e.code}", 1, body=e.read().decode(errors="replace")[:400])
+    except urllib.error.URLError as e:
+        die(f"cannot reach {BASE}: {e.reason}")
+    if "text/event-stream" in ctype:
+        msgs = [json.loads(l[5:]) for l in raw.splitlines() if l.startswith("data:") and l[5:].strip()]
+        msg = next((m for m in msgs if m.get("id") == _rpc_id), msgs[-1] if msgs else {})
+    else:
+        msg = json.loads(raw)
+    if "error" in msg:
+        die(f"MCP error: {msg['error'].get('message')}", 1, tool=tool)
+    res = msg.get("result", {})
+    text = "".join(c.get("text", "") for c in res.get("content", []) if c.get("type") == "text")
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = {"summary": text}
+    if res.get("isError"):
+        die(parsed.get("summary") or parsed.get("message") or text, 1, tool=tool, detail=parsed)
+    return parsed
+
+
+def journal_add(tool, summary, **ids):
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with JOURNAL.open("a") as f:
+        f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": tool, "summary": summary, **ids}) + "\n")
+
+
+def journal_read():
+    if not JOURNAL.exists():
+        return []
+    return [json.loads(l) for l in JOURNAL.read_text().splitlines() if l.strip()]
+
+
+def journal_write(rows):
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = JOURNAL.with_suffix(".new")
+    tmp.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    tmp.replace(JOURNAL)
+
+
+def opt(argv, name, default=None, flag=False):
+    if name in argv:
+        i = argv.index(name)
+        if flag:
+            argv.pop(i)
+            return True
+        if i + 1 >= len(argv):
+            die(f"{name} needs a value", 2)
+        v = argv[i + 1]
+        del argv[i:i + 2]
+        return v
+    return False if flag else default
+
+
+def expand(items):
+    """quantity n → n identical bulk_add items (the server adds one bottle per item)."""
+    if not isinstance(items, list) or not items:
+        die("items must be a non-empty JSON list", 2)
+    flat = []
+    for i, it in enumerate(items):
+        it = dict(it)
+        q = it.pop("quantity", 1)
+        if not isinstance(q, int) or q < 1:
+            die(f"item {i}: quantity must be a positive integer", 2)
+        if "vintage" in it and it["vintage"] is not None:
+            it["vintage"] = str(it["vintage"])
+        flat.extend(dict(it) for _ in range(q))
+    if len(flat) > MAX_BATCH:
+        die(f"{len(flat)} bottles in this batch — max {MAX_BATCH}; split it", 2)
+    return flat
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        sys.exit(0 if argv else 2)
+    cmd, argv = argv[0], argv[1:]
+
+    if cmd == "ping":
+        cellars = mcp("list_cellars")
+        out({"ok": True, "url": BASE, "cellars": cellars.get("summary")})
+
+    if cmd == "list-cellars":
+        out(mcp("list_cellars"))
+
+    if cmd == "create-cellar":
+        if len(argv) != 1:
+            die("usage: cellarion create-cellar <name>", 2)
+        r = mcp("create_cellar", {"name": argv[0]})
+        journal_add("create_cellar", r.get("summary"), cellar_id=r.get("data", {}).get("cellar_id"))
+        out(r)
+
+    if cmd == "racks":
+        if len(argv) != 1:
+            die("usage: cellarion racks <cellar_id>", 2)
+        out(mcp("list_racks", {"cellar_id": argv[0]}))
+
+    if cmd == "search":
+        args = {}
+        for k, flag in (("cellar_id", "--cellar"), ("vintage", "--vintage"), ("status", "--status")):
+            v = opt(argv, flag)
+            if v:
+                args[k] = v
+        lim = opt(argv, "--limit")
+        if lim:
+            args["limit"] = int(lim)
+        if argv:
+            args["query"] = " ".join(argv)
+        out(mcp("search_bottles", args))
+
+    if cmd == "resolve":
+        args = {}
+        for k in ("name", "producer", "country", "type", "vintage", "region", "appellation"):
+            v = opt(argv, "--" + k)
+            if v:
+                args[k] = v
+        if argv or "name" not in args:
+            die("usage: cellarion resolve --name N [--producer P] [--country C] [--type T] [--vintage V]", 2)
+        out(mcp("resolve_wine", args))
+
+    if cmd == "add":
+        pid = opt(argv, "--apply")
+        if pid:
+            if argv:
+                die("usage: cellarion add --apply <preview_id>", 2)
+            r = mcp("bulk_add", {"mode": "apply", "preview_id": pid})
+            d = r.get("data", {})
+            journal_add("bulk_add", r.get("summary"), preview_id=pid, bottle_ids=d.get("added_bottle_ids", []))
+            out(r)
+        cellar = opt(argv, "--cellar")
+        if not cellar or len(argv) != 1:
+            die("usage: cellarion add --cellar <cellar_id> <items.json|->", 2)
+        raw = sys.stdin.read() if argv[0] == "-" else Path(argv[0]).read_text()
+        items = expand(json.loads(raw))
+        r = mcp("bulk_add", {"mode": "preview", "cellar_id": cellar, "items": items})
+        r["bottles_in_batch"] = len(items)
+        r["next"] = "show this plan to JB; after he confirms: cellarion add --apply <preview_id>"
+        out(r)
+
+    if cmd == "photo":
+        label_only = opt(argv, "--label-only", flag=True)
+        bottle, wine = opt(argv, "--bottle"), opt(argv, "--wine")
+        if len(argv) != 1 or bool(bottle) == bool(wine):
+            die("usage: cellarion photo <image> (--bottle ID | --wine ID) [--label-only]", 2)
+        args = {"image_base64": base64.b64encode(Path(argv[0]).read_bytes()).decode()}
+        args["bottle_id" if bottle else "wine_id"] = bottle or wine
+        if label_only:
+            args["label_only"] = True
+        r = mcp("attach_bottle_image", args)
+        journal_add("attach_bottle_image", r.get("summary"), bottle_id=bottle, wine_id=wine)
+        out(r)
+
+    if cmd == "place":
+        if len(argv) != 3:
+            die("usage: cellarion place <rack_id> <position> <bottle_id>", 2)
+        r = mcp("place_bottle", {"rack_id": argv[0], "position": int(argv[1]), "bottle_id": argv[2]})
+        journal_add("place_bottle", r.get("summary"), rack_id=argv[0], position=int(argv[1]), bottle_id=argv[2])
+        out(r)
+
+    if cmd == "undo-last":
+        batch = opt(argv, "--batch", flag=True)
+        if argv:
+            die("usage: cellarion undo-last [--batch]", 2)
+        rows = journal_read()
+        if not batch:
+            r = mcp("undo_last")
+            if rows and rows[-1]["tool"] == r.get("data", {}).get("undone"):
+                rows.pop()
+                journal_write(rows)
+            out(r)
+        # --batch: pop this CLI's own actions newest-first down to (and incl.) the last bulk_add.
+        # undo_last is account-wide, so each step checks it undid the tool we expected and stops if not.
+        idx = max((i for i, x in enumerate(rows) if x["tool"] == "bulk_add"), default=None)
+        if idx is None:
+            die("no `add --apply` batch in the journal to undo", 1)
+        done = []
+        while len(rows) > idx:
+            want = rows[-1]
+            r = mcp("undo_last")
+            got = r.get("data", {}).get("undone")
+            done.append({"expected": want["tool"], "undone": got, "summary": r.get("summary")})
+            if got != want["tool"]:
+                die("undo_last reverted something other than this CLI's last action — stopped; check the app",
+                    1, steps=done)
+            rows.pop()
+            journal_write(rows)
+        out({"ok": True, "undone_steps": done})
+
+    if cmd == "journal":
+        out(journal_read())
+
+    die(f"unknown command '{cmd}' — cellarion --help", 2)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -88,3 +88,9 @@ These are deployment checks, not claimed as verified by the source-only tests.
 Run `python3 deploy/test_compose.py`. It uses Docker Compose's config renderer
 with public dummy values and an empty environment file; it starts no containers
 and does not read deployment secrets. Deployment smoke checks remain with DEV-60.
+
+## Intake (DEV-70)
+
+Adding bottles from shelf photos (Cleo on Telegram, or any agent) follows `deploy/INTAKE.md`.
+It uses the `cellarion` CLI. The installed copy is `~/ops/bin/cellarion` on Theo; `deploy/cellarion-cli`
+is the versioned source. Keep the two in sync.
