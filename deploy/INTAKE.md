@@ -73,3 +73,111 @@ https://wines.exerun.com from a photo. Follow this exactly so every intake works
 - No writes without JB's confirmation of the table.
 - Never put the token, or JB's password (`~/.config/cellarion/jb.password`), in chat, logs, issues
   or memory.
+
+## Bulk import from a file (no AI key needed)
+
+For an old spreadsheet, a Vivino export or a CellarTracker export, use the app, not the CLI:
+**Cellar → Import bottles** at https://wines.exerun.com. This server has **no AI key** (no
+`ANTHROPIC_API_KEY`, `OPENAI_*` or `VOYAGE_API_KEY`), and the file import still works. Checked in
+DEV-72 against v1.274.0 (`frontend/src/utils/importMappers.js`, `backend/src/routes/import.js`) and
+with a live run.
+
+### What works without AI
+
+| Path | Works without a key? | Notes |
+|---|---|---|
+| Plain CSV (your own spreadsheet) | Yes | Parsed in the browser, then `POST /api/bottles/import/validate` → review → `/confirm` |
+| Vivino CSV export | Yes | Same flow |
+| CellarTracker CSV export | Yes | Same flow; also places bottles in racks from `Location` + `Bin` |
+| Cellarion export (`.json`/`.zip`, Settings → import) | Yes | `POST /api/cellar-import`; no AI at all |
+| Receipt photo/PDF | **No** | `POST /api/bottles/import/receipt` returns 503 `ai_unavailable`. There is no OCR fallback. |
+
+The CSV is parsed in the browser. The server only receives the mapped rows, so the column names
+below are what matters. Header matching ignores case, spaces, `_`, `-` and `.`. Save the file as
+UTF-8 CSV; comma or semicolon both work.
+
+### How a row is resolved without AI
+
+The registry starts empty here. There is nothing to match against yet, so in practice each
+row ends up in one of these outcomes:
+
+- **Created automatically (`ai_new`, shown as "new wine")**: the row has **Producer + Wine +
+  a recognised Country + Type** (red/white/rosé/sparkling/dessert/fortified). The wine is created
+  from the file at confirm, with no AI call and no cost. A producer prefix in the wine name is
+  stripped ("Château Musar Rouge" with producer "Château Musar" becomes wine "Rouge").
+- **Exact/fuzzy match**: the wine is already in the registry (for example from an earlier
+  import). It is pre-selected.
+- **No match**: any row missing one of those four fields. You confirm it by hand on the review
+  screen. "Request wine" imports the bottle now and puts the wine in the admin queue (Admin → Wine
+  requests), where JB, as admin, creates the wine. The other options are picking a wine via
+  search, or skip.
+- **Refused**: a row with neither a wine name nor a producer (`error: Wine name or producer is
+  required`). The browser also drops rows with no wine name (`no-identity-skipped` warning).
+
+So the one rule for a cheap import: **fill Producer, Wine, Country and Type on every row.**
+
+Without AI, a producer written only inside the wine name is not split out for a plain CSV
+("Domaine Leflaive Puligny-Montrachet" with an empty Producer stays no-match). The backend can
+only split off producers that are already in the registry. The CellarTracker mapper does guess
+producers that start with Château/Domaine/Clos/Bodega/Weingut/Quinta/… . Put the producer in its
+own column.
+
+### Plain CSV: recommended template
+
+```csv
+Producer,Wine,Vintage,Country,Region,Appellation,Type,Quantity,Size,Price,Currency,Purchase Date,Store,Location,Notes,Rating
+Château Musar,Rouge,2016,Lebanon,Bekaa Valley,,Red,6,750ml,320,DKK,2024-03-01,Vinspecialisten,Kælder A,,
+```
+
+Columns the plain-CSV mapper reads (first alias that exists wins):
+
+| Field | Column names |
+|---|---|
+| Wine (required) | `Wine`, `Wine Name`, `WineName`, `Name` |
+| Producer | `Producer`, `Winery`, `Maker` |
+| Vintage | `Vintage`, `Year` (empty → NV, with a warning) |
+| Country / Region / Appellation | `Country`; `Region`; `Appellation`, `Sub-Region`, `SubRegion` |
+| Classification | `Classification` |
+| Type | `Type`, `Color`, `Colour`, `Category` (text containing red/white/rosé/sparkling/champagne/dessert/port/…) |
+| Quantity | `Quantity`, `Qty`, `Count` (one bottle per unit is created) |
+| Size | `Size`, `Bottle Size`, `BottleSize` (default 750ml) |
+| Price | `Price`, `Price per Bottle`, `Bottle Price`, `Unit Price`, `Purchase Price`, `Price Paid`, `Cost`, `Pris`, `Preis`, `Prix`, … or a header naming the currency, e.g. `Price (DKK)` |
+| Currency | `Currency` (**set it**; a price without a currency is not DKK) |
+| Purchase | `Purchase Date`, `PurchaseDate`, `Date`; `Store`, `Purchase Location`, `Vendor` |
+| Location | `Location`, `Bin` (free text) |
+| Racks (optional) | `Rack` + `Rack Position`/`Position`/`Slot`, or `Rack`+`Row`+`Col`, or combined `Rack Location` like `M2-11`; `Rack Rows`/`Rack Cols`/`Rack Type` size new racks |
+| Notes | `Notes`, `Note`, `Comments` |
+| Rating | `Rating`, `Score` (scale guessed: ≤5, ≤20 or 100-point) |
+
+There is **no grapes column** in the plain-CSV or Vivino mapper, so `Type` must be filled in. If
+the headers are exactly camelCase `wineName,producer,vintage,…`, the file is read as a Cellarion
+CSV export instead. Same fields, camelCase names.
+
+### Vivino export
+
+Upload Vivino's `full_wine_list.csv` (or `cellar.csv`) as is. Detected by a `Wine name` or `Winery`
+header. Read: `Winery` → producer, `Wine name`, `Vintage`, `Country`, `Region`, `Appellation`,
+`Wine type`, `Quantity`, `Bottle size`, `Price`/`Purchase Price` + `Currency`, `Purchase date`,
+`Store name`, `Your rating`, `Your review`, `Personal Note`, `Drinking Window`, `Location`/`Bin`.
+`Average rating` is ignored. A scan-history file (has `Scan date`) can go to the wishlist instead.
+Rows with Winery + Wine name + Country + Wine type are created automatically. Others need a
+request or a pick.
+
+### CellarTracker export
+
+Export **all** rows (not "only this page": exactly 25 rows triggers a truncation warning) as CSV.
+Detected by `iWine`/`Barcode`, or by `Wine` + `Vintage` + `Locale`/`Bin`. Read: `Wine`, `Producer`,
+`Vintage` (1001 → NV), `Quantity`/`Pending`, `Location` + `Bin` (→ racks), `Price`/`NativePrice`
++ currency, `Size`, `Type`/`Color`/`Category`, `Country`/`Region`/`SubRegion`/`Appellation` or
+`Locale`, `Varietal`/`MasterVarietal` (grapes), `BeginConsume`/`EndConsume`, `MY`/`MyScore`, notes.
+
+### Features that need a paid key (not enabled; that is DEV-74)
+
+- **Label scan from the phone camera** (`POST /api/wines/scan-label`): Anthropic, default model
+  `claude-sonnet-5` (at $2/$10 per M tokens, roughly $0.01–0.02 per label).
+- **Receipt import**: same vision model, roughly $0.02–0.05 per receipt.
+- **AI identification of incomplete import rows**: per unique wine, roughly $0.01 each. It is
+  capped by the AI budget.
+- **Cellar Chat**: needs both an Anthropic key (default `claude-haiku-4-5`, $1/$5 per M tokens,
+  about $0.01 per question) **and** an embeddings key (`VOYAGE_API_KEY`, `voyage-4-large`). Embedding
+  a cellar of a few hundred wines costs cents.
