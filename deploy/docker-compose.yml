@@ -67,6 +67,7 @@ services:
       - BACKEND_URL=${BACKEND_URL:-https://wines.exerun.com}
       - SUPER_ADMIN_EMAIL=${SUPER_ADMIN_EMAIL:-jb@jepcom.dk}
       - TRUST_PROXY_HOPS=${TRUST_PROXY_HOPS:-2}
+      - ALLOW_REGISTRATION=${ALLOW_REGISTRATION:-0}
       - NODE_ENV=production
       - NODE_OPTIONS=--max-old-space-size=480
       - MONGO_URI=mongodb://mongo:27017/winecellar

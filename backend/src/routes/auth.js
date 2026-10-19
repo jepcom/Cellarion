@@ -11,6 +11,7 @@ const eventBus = require('../services/eventBus');
 const { revokeOAuthConnectionsForUser } = require('../services/mcpOAuth');
 const { CURRENT_PRIVACY_POLICY_VERSION } = require('../config/legal');
 const rateLimitsConfig = require('../config/rateLimits');
+const { isRegistrationAllowed } = require('../config/registration');
 const { sendVerificationEmail, sendPasswordResetEmail, sendAccountLockoutAlert, EMAIL_VERIFICATION_ENABLED } = require('../services/mailgun');
 const { isAccountLocked, isAccountLockedNow, recordLoginFailure, resetLoginAttempts } = require('../utils/loginAttempts');
 const { rateLimitKey } = require('../utils/clientIp');
@@ -110,6 +111,10 @@ const demoLimiter = rateLimit({
 
 // POST /api/auth/register - Register new user
 router.post('/register', authLimiter, async (req, res) => {
+  if (!isRegistrationAllowed()) {
+    return res.status(403).json({ error: 'Registration is closed' });
+  }
+
   try {
     const { username, email, password, consentPrivacyPolicy, consentDataProcessing, signupSource } = req.body;
 

@@ -32,7 +32,7 @@ volume names from the rendered application instead of assuming `cellarion_*`.
 
 ## Coolify environment
 
-There is no repository `.env` or `env_file`. Enter these six runtime variables in
+There is no repository `.env` or `env_file`. Enter these runtime variables in
 Coolify; both secrets must be freshly generated at deployment time and kept there.
 
 | Variable | Value |
@@ -43,8 +43,9 @@ Coolify; both secrets must be freshly generated at deployment time and kept ther
 | `BACKEND_URL` | `https://wines.exerun.com` |
 | `SUPER_ADMIN_EMAIL` | `jb@jepcom.dk` |
 | `TRUST_PROXY_HOPS` | `2` |
+| `ALLOW_REGISTRATION` | `0` (default closed); only `1` opens password signup |
 
-The last four also have these defaults in Compose. Fixed container variables are:
+The non-secret variables also have these defaults in Compose. Fixed container variables are:
 backend `NODE_ENV=production`, `NODE_OPTIONS=--max-old-space-size=480`,
 `MONGO_URI=mongodb://mongo:27017/winecellar`, `PORT=5000`,
 `MEILI_URL=http://meilisearch:7700`, `REMBG_URL=http://rembg:5000`;
@@ -61,11 +62,18 @@ are preserved.
 
 The `jesper` super-admin role and disabling anonymous `/api/mcp/public` require
 application configuration/data; `SUPER_ADMIN_EMAIL` alone does not complete
-these prerequisites. In v1.274.0, `backend/src/routes/auth.js` registers
-`POST /register` without a registration-closure switch. DEV-60 must resolve
-registration closure before public exposure and coordinate the role prerequisite
-with DEV-64/JB. This PR does not implement application changes or authorize
-database writes. The anonymous MCP switch is `mcp.publicEnabled=0` in the
+these prerequisites. The fork closes `POST /api/auth/register` by default with a
+JSON 403 before any account lookup. To temporarily open signup for a second
+account, set `ALLOW_REGISTRATION=1` in Coolify, redeploy, register, then set it
+back to `0` and redeploy. DEV-60 must verify the refusal from outside Theo before
+public exposure and coordinate the role prerequisite with DEV-64/JB.
+
+The pinned upstream `1.274.0` backend image does not contain this fork patch.
+DEV-60 must arrange a backend artifact containing the patch before exposing the
+route; changing the environment alone on the upstream image does not close signup.
+Image pins are unchanged here, and no deployment or database writes are authorized.
+
+The anonymous MCP switch is `mcp.publicEnabled=0` in the
 admin rate-limit configuration; preserve personal MCP with `mcp.enabled=1`.
 Keep personal `/api/mcp` token access available and verify unauthenticated access
 returns 401. Verify valid HTTPS, no host-published service ports, and client IP

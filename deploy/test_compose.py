@@ -66,17 +66,25 @@ class ComposeContract(unittest.TestCase):
         self.assertEqual(set(self.services['mongo']['cap_add']),
                          {'CHOWN', 'DAC_OVERRIDE', 'SETGID', 'SETUID'})
 
+    def test_registration_can_be_opened_explicitly(self):
+        env = {**ENV, 'ALLOW_REGISTRATION': '1'}
+        result = render(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['services']['backend']
+                         ['environment']['ALLOW_REGISTRATION'], '1')
+
     def test_environment_and_required_secrets(self):
         backend = self.services['backend']['environment']
         for key in ('FRONTEND_URL', 'BACKEND_URL'):
             self.assertEqual(backend[key], 'https://wines.exerun.com')
         self.assertEqual(backend['SUPER_ADMIN_EMAIL'], 'jb@jepcom.dk')
         self.assertEqual(backend['TRUST_PROXY_HOPS'], '2')
+        self.assertEqual(backend['ALLOW_REGISTRATION'], '0')
         self.assertEqual(backend['MEILI_MASTER_KEY'],
                          self.services['meilisearch']['environment']['MEILI_MASTER_KEY'])
         self.assertEqual(set(backend), {
             'JWT_SECRET', 'MEILI_MASTER_KEY', 'FRONTEND_URL', 'BACKEND_URL',
-            'SUPER_ADMIN_EMAIL', 'TRUST_PROXY_HOPS', 'NODE_ENV', 'NODE_OPTIONS',
+            'SUPER_ADMIN_EMAIL', 'TRUST_PROXY_HOPS', 'ALLOW_REGISTRATION', 'NODE_ENV', 'NODE_OPTIONS',
             'MONGO_URI', 'PORT', 'MEILI_URL', 'REMBG_URL'})
         for key in ('JWT_SECRET', 'MEILI_MASTER_KEY'):
             for value in (None, ''):
