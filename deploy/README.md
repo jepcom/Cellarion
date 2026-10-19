@@ -54,7 +54,7 @@ Meilisearch `MEILI_ENV=production`, `MEILI_MAX_INDEXING_MEMORY=128Mb`,
 No other variables need entering. Optional upstream integrations are not forwarded.
 
 Mongo retains the upstream digest; Meilisearch retains upstream's `v1.45.1` tag
-(upstream does not digest-pin it). All three Cellarion images stay at `1.274.0`.
+(upstream does not digest-pin it). Frontend and rembg stay on upstream `1.274.0`; backend is built from source.
 The legacy hardening anchor, capability exception, memory limits and healthchecks
 are preserved.
 
@@ -68,10 +68,9 @@ account, set `ALLOW_REGISTRATION=1` in Coolify, redeploy, register, then set it
 back to `0` and redeploy. DEV-60 must verify the refusal from outside Theo before
 public exposure and coordinate the role prerequisite with DEV-64/JB.
 
-The pinned upstream `1.274.0` backend image does not contain this fork patch.
-DEV-60 must arrange a backend artifact containing the patch before exposing the
-route; changing the environment alone on the upstream image does not close signup.
-Image pins are unchanged here, and no deployment or database writes are authorized.
+The upstream `1.274.0` backend image does not contain this fork patch, so Compose
+builds `backend` from this repository's `backend/` directory (tagged
+`cellarion-backend:1.274.0-jb`). Frontend and rembg stay on the upstream images.
 
 The anonymous MCP switch is `mcp.publicEnabled=0` in the
 admin rate-limit configuration; preserve personal MCP with `mcp.enabled=1`.
