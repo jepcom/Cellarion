@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""cellar-read-mcp — read-only stdio MCP server exposing JB's wine cellar to OpenClaw agents (DEV-73).
+
+One tool, `get_cellar`, which runs `~/ops/bin/cellarion cellar` with the READ-ONLY token
+~/.config/cellarion/token-read (scope `read`; Cellarion does not even list write tools for it).
+Chef and Ray have `exec` denied, so this is how they see the cellar. Registered in
+~/.openclaw/openclaw.json → mcp.servers.cellar. No dependencies; newline-delimited JSON-RPC on stdio.
+"""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+CLI = str(HOME / "ops/bin/cellarion")
+ENV = {**os.environ, "CELLARION_TOKEN_FILE": str(HOME / ".config/cellarion/token-read")}
+
+TOOL = {
+    "name": "get_cellar",
+    "description": (
+        "JB's wine cellar as it is right now (read-only). Returns every wine in stock that is inside or near "
+        "its drink window, grouped by wine+vintage: producer, wine, vintage, type, grapes, region, country, "
+        "quantity, locations (rack and slot, e.g. 'Kælder / Reol A #7 (row 2, col 3)'), drink_window, window "
+        "(in | approaching | past | unknown) and in_window. include_all=true also lists bottles that are not "
+        "ready yet (window not_yet) and reserved ones. counts.in_stock = 0 means the cellar is empty: say "
+        "'nothing in stock yet' and never invent a bottle. Use for food pairing ('hvilken vin til ...')."
+    ),
+    "inputSchema": {"type": "object", "properties": {
+        "include_all": {"type": "boolean", "description": "also list not-ready and reserved bottles"}}},
+    "annotations": {"readOnlyHint": True},
+}
+
+
+def reply(i, result=None, error=None):
+    msg = {"jsonrpc": "2.0", "id": i}
+    msg.update({"error": error} if error else {"result": result})
+    sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def get_cellar(args):
+    cmd = [CLI, "cellar"] + (["--all"] if args.get("include_all") else [])
+    p = subprocess.run(cmd, env=ENV, capture_output=True, text=True, timeout=90)
+    text = p.stdout if p.returncode == 0 else (p.stderr or p.stdout or "cellarion failed")
+    return {"content": [{"type": "text", "text": text}], "isError": p.returncode != 0}
+
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    try:
+        req = json.loads(line)
+    except ValueError:
+        continue
+    i, method = req.get("id"), req.get("method")
+    if i is None:
+        continue  # notification
+    if method == "initialize":
+        reply(i, {"protocolVersion": req.get("params", {}).get("protocolVersion", "2025-06-18"),
+                  "capabilities": {"tools": {}},
+                  "serverInfo": {"name": "cellar", "version": "1"}})
+    elif method == "ping":
+        reply(i, {})
+    elif method == "tools/list":
+        reply(i, {"tools": [TOOL]})
+    elif method == "tools/call":
+        params = req.get("params", {})
+        if params.get("name") != "get_cellar":
+            reply(i, error={"code": -32602, "message": f"unknown tool {params.get('name')}"})
+            continue
+        try:
+            reply(i, get_cellar(params.get("arguments") or {}))
+        except Exception as e:  # timeout etc. — report, keep serving
+            reply(i, {"content": [{"type": "text", "text": f"cellar lookup failed: {e}"}], "isError": True})
+    else:
+        reply(i, error={"code": -32601, "message": f"method not found: {method}"})
