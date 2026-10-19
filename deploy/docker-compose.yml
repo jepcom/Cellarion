@@ -1,0 +1,128 @@
+# Cellarion 1.274.0 — Coolify Git-sourced Docker Compose application.
+# Configure frontend domain https://wines.exerun.com:8080 in Coolify;
+# Coolify generates the HTTPS/redirect labels and joins its proxy to the stack network.
+# Public URL: https://wines.exerun.com. See README.md before deployment.
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  mongo:
+    <<: *hardening
+    labels:
+      traefik.enable: "false"
+    image: mongo:7@sha256:340c1c56fb10e95cf79ff547f8664b96bc6ead9909bc355238cbf865a9695a6f
+    cap_add: [CHOWN, DAC_OVERRIDE, SETGID, SETUID]
+    command: ["mongod", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes:
+      - mongo-data:/data/db
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/27017' 2>/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  meilisearch:
+    <<: *hardening
+    labels:
+      traefik.enable: "false"
+    image: getmeili/meilisearch:v1.45.1
+    environment:
+      - MEILI_MASTER_KEY=${MEILI_MASTER_KEY:?}
+      - MEILI_ENV=production
+      - MEILI_MAX_INDEXING_MEMORY=128Mb
+      - MEILI_MAX_INDEXING_THREADS=2
+      - MEILI_NO_ANALYTICS=true
+    volumes:
+      - meili-data:/meili_data
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    <<: *hardening
+    labels:
+      traefik.enable: "false"
+    image: ghcr.io/jagduvi1/cellarion-backend:1.274.0
+    stop_grace_period: 15s
+    init: true
+    environment:
+      - JWT_SECRET=${JWT_SECRET:?}
+      - MEILI_MASTER_KEY=${MEILI_MASTER_KEY:?}
+      - FRONTEND_URL=${FRONTEND_URL:-https://wines.exerun.com}
+      - BACKEND_URL=${BACKEND_URL:-https://wines.exerun.com}
+      - SUPER_ADMIN_EMAIL=${SUPER_ADMIN_EMAIL:-jb@jepcom.dk}
+      - TRUST_PROXY_HOPS=${TRUST_PROXY_HOPS:-2}
+      - NODE_ENV=production
+      - NODE_OPTIONS=--max-old-space-size=480
+      - MONGO_URI=mongodb://mongo:27017/winecellar
+      - PORT=5000
+      - MEILI_URL=http://meilisearch:7700
+      - REMBG_URL=http://rembg:5000
+    volumes:
+      - uploads-data:/app/uploads
+    deploy:
+      resources:
+        limits:
+          memory: 640M
+    depends_on:
+      mongo:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rembg:
+    <<: *hardening
+    labels:
+      traefik.enable: "false"
+    image: ghcr.io/jagduvi1/cellarion-rembg:1.274.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+  frontend:
+    <<: *hardening
+    image: ghcr.io/jagduvi1/cellarion-frontend:1.274.0
+    # Only frontend receives a domain; no host port is published.
+    expose:
+      - "8080"
+    labels:
+      traefik.enable: "true"
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  mongo-data:
+  meili-data:
+  uploads-data:
