@@ -57,7 +57,11 @@ services:
     <<: *hardening
     labels:
       traefik.enable: "false"
-    image: ghcr.io/jagduvi1/cellarion-backend:1.274.0
+    # Built from this fork's backend/ (1.274.0 + DEV-67 registration patch);
+    # the upstream ghcr image does not contain the patch.
+    build:
+      context: ../backend
+    image: cellarion-backend:1.274.0-jb
     stop_grace_period: 15s
     init: true
     environment:

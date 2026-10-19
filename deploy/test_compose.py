@@ -34,7 +34,11 @@ class ComposeContract(unittest.TestCase):
         for name, service in self.services.items():
             self.assertFalse(service.get('ports'), name)
             self.assertNotIn('container_name', service)
-            self.assertNotIn('build', service)
+            if name == 'backend':
+                self.assertEqual(Path(service['build']['context']),
+                                 COMPOSE.parent.parent / 'backend')
+            else:
+                self.assertNotIn('build', service)
             self.assertEqual(service['labels']['traefik.enable'],
                              'true' if name == 'frontend' else 'false')
         self.assertEqual(self.services['frontend']['expose'], ['8080'])
@@ -48,8 +52,9 @@ class ComposeContract(unittest.TestCase):
         images = {
             'mongo': 'mongo:7@sha256:340c1c56fb10e95cf79ff547f8664b96bc6ead9909bc355238cbf865a9695a6f',
             'meilisearch': 'getmeili/meilisearch:v1.45.1',
+            'backend': 'cellarion-backend:1.274.0-jb',
             **{name: f'ghcr.io/jagduvi1/cellarion-{name}:1.274.0'
-               for name in ('backend', 'frontend', 'rembg')},
+               for name in ('frontend', 'rembg')},
         }
         limits = dict(mongo=512, meilisearch=256, backend=640, rembg=1536, frontend=64)
         for name, service in self.services.items():
