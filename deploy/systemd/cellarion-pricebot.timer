@@ -1,0 +1,11 @@
+[Unit]
+Description=Monthly Cellarion price estimates
+
+[Timer]
+OnCalendar=*-*-01 04:15:00 Europe/Copenhagen
+RandomizedDelaySec=30m
+Persistent=true
+Unit=cellarion-pricebot.service
+
+[Install]
+WantedBy=timers.target

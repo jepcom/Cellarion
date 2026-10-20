@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Monthly pricebot; dry run by default, --apply uses only the dedicated token.
+
+The current API has no authorized read route for WineVintagePrice history.
+--snapshots must contain a fresh, complete data export supplied by operations:
+{"as_of":"2026-10-20T12:00:00+00:00", "complete":true,
+ "prices":[{"wine_id":"...", "vintage":"2020", "price":100,
+             "currency":"DKK", "set_at":"2026-01-01T00:00:00+00:00"}]}
+Never infer absence from the local journal or a price-tracking request queue.
+"""
+import argparse
+import datetime as dt
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+from cellarion_pricebot import lookup
+
+
+def load_cli():
+    loader = importlib.machinery.SourceFileLoader('cellarion_cli', str(Path(__file__).with_name('cellarion-cli')))
+    if not Path(loader.path).exists():
+        loader = importlib.machinery.SourceFileLoader('cellarion_cli', str(Path(__file__).with_name('cellarion')))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def stamp(value):
+    parsed = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if parsed.tzinfo is None:
+        raise ValueError('snapshot timestamps must include timezone')
+    return parsed
+
+
+def latest_prices(path):
+    data = json.loads(Path(path).read_text())
+    age = dt.datetime.now(dt.timezone.utc) - stamp(data['as_of'])
+    if data.get('complete') is not True or not dt.timedelta(0) <= age <= dt.timedelta(days=1):
+        raise ValueError('need complete snapshot export less than 24 hours old')
+    latest = {}
+    for row in data['prices']:
+        key = (row['wine_id'], row['vintage'])
+        if row.get('currency') not in ('DKK', 'EUR', 'USD', 'SEK', 'NOK'):
+            raise ValueError('invalid snapshot currency')
+        if key not in latest or stamp(row['set_at']) > stamp(latest[key]['set_at']):
+            latest[key] = row
+    return latest
+
+
+def due(row, now=None):
+    return row is None or (now or dt.datetime.now(dt.timezone.utc)) - stamp(row['set_at']) > dt.timedelta(days=180)
+
+
+def inventory(cli):
+    groups = {}
+    for b in cli.price_bottles():
+        w = b.get('wine') or {}
+        key = (w.get('producer'), w.get('name'), b.get('vintage'))
+        g = groups.setdefault(key, {'bottle_id': b['bottle_id'], 'wine': w, 'vintage': b.get('vintage') or 'NV', 'invoice': False})
+        g['invoice'] |= b.get('price') is not None
+    wines = []
+    for g in groups.values():
+        d = cli.price_mcp('get_bottle', {'bottle_id': g['bottle_id']}).get('data', {})
+        if not (d.get('wine') or {}).get('wine_id'):
+            raise ValueError('bottle detail did not contain registry wine id')
+        g['wine'] = d['wine']
+        g['invoice'] |= d.get('price') is not None
+        wines.append(g)
+    # An invoice anywhere on the wine protects every vintage from automation.
+    protected = {g['wine']['wine_id'] for g in wines if g['invoice']}
+    return [g for g in wines if g['wine']['wine_id'] not in protected]
+
+
+def notify(message):
+    env = dict(os.environ)
+    env['PATH'] = str(Path.home() / '.openclaw/tools/node-v24.19.0/bin') + ':' + env.get('PATH', '')
+    subprocess.run(['openclaw', 'message', 'send', '--channel', 'telegram', '--target', '802893059', '-m', message],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, env=env)
+
+
+def main():
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--snapshots', help='fresh complete WineVintagePrice data export; required for writes')
+    parser.add_argument('--output', required=True)
+    parser.add_argument('--limit', type=int)
+    args = parser.parse_args()
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with output.with_suffix('.lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            if args.apply and not args.snapshots:
+                raise ValueError('no authoritative snapshot read API; --snapshots export required, refusing writes')
+            prices = latest_prices(args.snapshots) if args.snapshots else {}
+            cli = load_cli()
+            cli.TOKEN_FILE = cli.PRICE_TOKEN
+            # Validate before searching. Never fall back to Cleo's credential.
+            cli.token()
+            targets = inventory(cli)
+            targets = [g for g in targets if not args.snapshots or due(prices.get((g['wine']['wine_id'], g['vintage'])))]
+            if args.limit:
+                targets = targets[:args.limit]
+            counts = dict(priced=0, ukendt=0, changed_over_25_percent=0, failures=0)
+            with output.open('w') as report:
+                for i, g in enumerate(targets):
+                    started = time.monotonic()
+                    try:
+                        result = lookup(g['wine'], g['vintage'])
+                        p = result['pick']
+                        counts['priced' if p else 'ukendt'] += 1
+                        old = prices.get((g['wine']['wine_id'], g['vintage']))
+                        if p and old and old['currency'] == 'DKK' and old['price'] > 0:
+                            counts['changed_over_25_percent'] += abs(p['price_dkk'] / old['price'] - 1) > .25
+                        if args.apply and p:
+                            cli.set_price(g['wine']['wine_id'], g['vintage'], p['price_dkk'], p['source'], p['somm_notes'])
+                        report.write(json.dumps(result, ensure_ascii=False) + '\n')
+                        report.flush()
+                    except (Exception, SystemExit):
+                        counts['failures'] += 1
+                        report.write(json.dumps({'wine_id': g['wine']['wine_id'], 'error': 'lookup/write failed'}) + '\n')
+                        report.flush()
+                    if args.apply and i + 1 < len(targets):
+                        time.sleep(max(0, 120 - (time.monotonic() - started)))
+            summary = 'Pricebot: ' + ', '.join(f'{k}={v}' for k, v in counts.items())
+            print(summary)
+            if args.apply:
+                notify(summary)
+            return int(bool(counts['failures']))
+        except (Exception, SystemExit):
+            if args.apply:
+                notify('Pricebot failed; see journalctl --user -u cellarion-pricebot.service')
+            raise
+
+
+if __name__ == '__main__':
+    sys.exit(main())

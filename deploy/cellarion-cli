@@ -5,6 +5,9 @@ Talks to Cellarion's MCP endpoint with a personal API token (scopes read+write+c
 is read from ~/.config/cellarion/token (must be mode 600) and only ever sent as a header; it never
 appears on a command line or in output. Every command prints JSON.
 
+  cellarion price-lookup <wine_id> [--vintage V]  dry run: structured retail offers and pick
+  cellarion set-price <wine_id> <vintage> <dkk> --source SOURCE [--notes TEXT]
+                                              estimate via dedicated pricebot token, currency DKK
   cellarion ping                              token works? (whoami + token scopes)
   cellarion list-cellars                      cellars: id, name, bottle count
   cellarion create-cellar <name>              new cellar (only if JB has none yet; undoable)
@@ -35,6 +38,7 @@ with scope `read` only — every write verb fails on it server-side.
 Exit codes: 0 ok, 1 API/tool error, 2 usage, 3 token missing/unsafe.
 """
 import base64
+import math
 import json
 import os
 import stat
@@ -253,11 +257,90 @@ def cellar_view(only_cellar=None, show_all=False):
     return res
 
 
+PRICE_TOKEN = Path.home() / ".config/cellarion/token-pricebot"
+PRICE_TOOLS = {"get_wine", "get_bottle", "list_cellars", "search_bottles", "set_vintage_price"}
+
+
+def price_mcp(tool, args=None):
+    """Use only the dedicated credential and an explicit tool allowlist."""
+    global TOKEN_FILE
+    if tool not in PRICE_TOOLS:
+        die("tool not allowed for pricebot", 2)
+    previous = TOKEN_FILE
+    TOKEN_FILE = PRICE_TOKEN
+    try:
+        return mcp(tool, args)
+    finally:
+        TOKEN_FILE = previous
+
+
+def price_bottles():
+    rows, offset = [], 0
+    while True:
+        result = price_mcp("search_bottles", {"status": "active", "limit": 50, "offset": offset})
+        rows.extend(result.get("data", []))
+        offset += 50
+        if offset >= result.get("page", {}).get("total", 0):
+            return rows
+
+
+def invoice_present(wine_id):
+    # Inspect every matching owned active bottle of
+    # this wine before writing a shared valuation. Never write Bottle.price.
+    wine = price_mcp("get_wine", {"wine_id": wine_id}).get("data", {})
+    for b in price_bottles():
+        identity = b.get("wine") or {}
+        if (identity.get("name"), identity.get("producer")) == (wine.get("name"), wine.get("producer")):
+            # Treat a non-null price, including zero, as an invoice record.
+            if b.get("price") is not None:
+                return True
+            detail = price_mcp("get_bottle", {"bottle_id": b["bottle_id"]}).get("data", {})
+            if detail.get("price") is not None:
+                return True
+    return False
+
+
+def set_price(wine_id, vintage, amount, source, notes=""):
+    if not math.isfinite(amount) or amount <= 0 or len(source) > 100 or not source.startswith("skøn: "):
+        die("price must be positive and finite; source must start with 'skøn: ' and be <=100 characters", 2)
+    if len(notes) > 2000:
+        die("somm_notes exceeds 2000 characters", 2)
+    if invoice_present(wine_id):
+        die("invoice price exists for this wine; skipping estimate")
+    result = price_mcp("set_vintage_price", {"wine_id": wine_id, "vintage": vintage,
+                        "price": amount, "currency": "DKK", "source": source, "somm_notes": notes})
+    journal_add("set_vintage_price", result.get("summary"), wine_id=wine_id, vintage=vintage,
+                credential="pricebot", price_entry_id=result.get("data", {}).get("price_entry_id"))
+    return result
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
         sys.exit(0 if argv else 2)
     cmd, argv = argv[0], argv[1:]
+
+    if cmd == "price-lookup":
+        vintage = opt(argv, "--vintage")
+        if len(argv) != 1:
+            die("usage: cellarion price-lookup <wine_id> [--vintage V]", 2)
+        from cellarion_pricebot import lookup
+        wine = mcp("get_wine", {"wine_id": argv[0]}).get("data", {})
+        result = lookup(wine, vintage)
+        journal_add("price_lookup", "dry run; no remote change", wine_id=argv[0], vintage=vintage,
+                    read_only=True)
+        out(result)
+
+    if cmd == "set-price":
+        source = opt(argv, "--source")
+        notes = opt(argv, "--notes", "")
+        if len(argv) != 3 or not source:
+            die("usage: cellarion set-price <wine_id> <vintage> <dkk> --source SOURCE [--notes TEXT]", 2)
+        try:
+            amount = float(argv[2])
+        except ValueError:
+            die("dkk must be a number", 2)
+        out(set_price(argv[0], argv[1], amount, source, notes))
 
     if cmd == "ping":
         cellars = mcp("list_cellars")
@@ -344,7 +427,10 @@ def main(argv):
         batch = opt(argv, "--batch", flag=True)
         if argv:
             die("usage: cellarion undo-last [--batch]", 2)
-        rows = journal_read()
+        rows = [r for r in journal_read() if not r.get("read_only")]
+        if rows and rows[-1].get("credential") == "pricebot":
+            global TOKEN_FILE
+            TOKEN_FILE = PRICE_TOKEN
         if not batch:
             r = mcp("undo_last")
             if rows and rows[-1]["tool"] == r.get("data", {}).get("undone"):
@@ -359,6 +445,7 @@ def main(argv):
         done = []
         while len(rows) > idx:
             want = rows[-1]
+            TOKEN_FILE = PRICE_TOKEN if want.get("credential") == "pricebot" else Path(os.environ.get("CELLARION_TOKEN_FILE", Path.home() / ".config/cellarion/token"))
             r = mcp("undo_last")
             got = r.get("data", {}).get("undone")
             done.append({"expected": want["tool"], "undone": got, "summary": r.get("summary")})
