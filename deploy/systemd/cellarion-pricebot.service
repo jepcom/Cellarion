@@ -1,0 +1,12 @@
+[Unit]
+Description=Cellarion monthly conservative retail price estimates
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/ops/bin:/usr/local/bin:/usr/bin:/bin
+Environment=TZ=Europe/Copenhagen
+ExecStartPre=%h/ops/bin/cellarion-price-snapshots --notify-failure --output %h/.local/state/cellarion/price-snapshots.json
+ExecStart=%h/ops/bin/pricebot --refresh-catalogue --apply --snapshots %h/.local/state/cellarion/price-snapshots.json --output %h/.local/state/cellarion/pricebot-monthly.jsonl
+TimeoutStartSec=12h
+UMask=0077
+NoNewPrivileges=true
