@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Monthly pricebot; dry run by default, --apply uses only the dedicated token.
 
-The current API has no authorized read route for WineVintagePrice history.
+ExecStartPre exports price history via the read-only cellarion-price-snapshots tool.
 --snapshots must contain a fresh, complete data export supplied by operations:
 {"as_of":"2026-10-20T12:00:00+00:00", "complete":true,
  "prices":[{"wine_id":"...", "vintage":"2020", "price":100,
@@ -19,7 +19,9 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from cellarion_pricebot import lookup
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from cellarion_pricebot import lookup, RATES
 
 
 def load_cli():
@@ -47,7 +49,7 @@ def latest_prices(path):
     latest = {}
     for row in data['prices']:
         key = (row['wine_id'], row['vintage'])
-        if row.get('currency') not in ('DKK', 'EUR', 'USD', 'SEK', 'NOK'):
+        if not isinstance(row.get('currency'), str) or len(row['currency']) != 3 or not row['currency'].isupper():
             raise ValueError('invalid snapshot currency')
         if key not in latest or stamp(row['set_at']) > stamp(latest[key]['set_at']):
             latest[key] = row
@@ -58,15 +60,18 @@ def due(row, now=None):
     return row is None or (now or dt.datetime.now(dt.timezone.utc)) - stamp(row['set_at']) > dt.timedelta(days=180)
 
 
-def inventory(cli):
+def inventory(cli, include_invoices=False, limit=None):
     groups = {}
     for b in cli.price_bottles():
         w = b.get('wine') or {}
         key = (w.get('producer'), w.get('name'), b.get('vintage'))
         g = groups.setdefault(key, {'bottle_id': b['bottle_id'], 'wine': w, 'vintage': b.get('vintage') or 'NV', 'invoice': False})
         g['invoice'] |= b.get('price') is not None
+    protected_names = {(g['wine'].get('producer'), g['wine'].get('name')) for g in groups.values() if g['invoice']}
+    selected = list(groups.values())[:limit] if limit is not None else list(groups.values())
     wines = []
-    for g in groups.values():
+    for g in selected:
+        g['invoice'] |= (g['wine'].get('producer'), g['wine'].get('name')) in protected_names
         d = cli.price_mcp('get_bottle', {'bottle_id': g['bottle_id']}).get('data', {})
         if not (d.get('wine') or {}).get('wine_id'):
             raise ValueError('bottle detail did not contain registry wine id')
@@ -75,7 +80,9 @@ def inventory(cli):
         wines.append(g)
     # An invoice anywhere on the wine protects every vintage from automation.
     protected = {g['wine']['wine_id'] for g in wines if g['invoice']}
-    return [g for g in wines if g['wine']['wine_id'] not in protected]
+    for g in wines:
+        g['invoice'] = g['wine']['wine_id'] in protected
+    return wines if include_invoices else [g for g in wines if not g['invoice']]
 
 
 def notify(message):
@@ -92,6 +99,7 @@ def main():
     parser.add_argument('--snapshots', help='fresh complete WineVintagePrice data export; required for writes')
     parser.add_argument('--output', required=True)
     parser.add_argument('--limit', type=int)
+    parser.add_argument('--workers', type=int, default=3, help='dry-run wine workers; writes always serial')
     args = parser.parse_args()
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -99,34 +107,52 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
             if args.apply and not args.snapshots:
-                raise ValueError('no authoritative snapshot read API; --snapshots export required, refusing writes')
+                raise ValueError('--snapshots export required, refusing writes')
             prices = latest_prices(args.snapshots) if args.snapshots else {}
             cli = load_cli()
             cli.TOKEN_FILE = cli.PRICE_TOKEN
             # Validate before searching. Never fall back to Cleo's credential.
             cli.token()
-            targets = inventory(cli)
+            targets = inventory(cli, include_invoices=not args.apply, limit=args.limit if not args.apply else None)
             targets = [g for g in targets if not args.snapshots or due(prices.get((g['wine']['wine_id'], g['vintage'])))]
             if args.limit:
                 targets = targets[:args.limit]
-            counts = dict(priced=0, ukendt=0, changed_over_25_percent=0, failures=0)
-            with output.open('w') as report:
-                for i, g in enumerate(targets):
+            counts = dict(priced=0, ukendt=0, changed_over_25_percent=0, failures=0, search_unavailable=0, change_comparison_unavailable=0, invoice_protected=sum(g['invoice'] for g in targets))
+            def inspect(g):
+                try:
+                    return lookup(g['wine'], g['vintage'])
+                except Exception as exc:
+                    return {'error': type(exc).__name__}
+            if not 1 <= args.workers <= 4:
+                raise ValueError('workers must be between 1 and 4')
+            context = nullcontext(None) if args.apply else ThreadPoolExecutor(max_workers=args.workers)
+            with output.open('w') as report, context as executor:
+                results = (None for _ in targets) if args.apply else executor.map(inspect, targets)
+                for i, (g, prepared) in enumerate(zip(targets, results)):
                     started = time.monotonic()
                     try:
-                        result = lookup(g['wine'], g['vintage'])
+                        result = lookup(g['wine'], g['vintage']) if args.apply else prepared
+                        if result.get('error'):
+                            raise RuntimeError(result['error'])
+                        result['invoice_protected'] = g['invoice']
                         p = result['pick']
-                        counts['priced' if p else 'ukendt'] += 1
+                        counts['search_unavailable'] += result.get('search_unavailable', False)
                         old = prices.get((g['wine']['wine_id'], g['vintage']))
-                        if p and old and old['currency'] == 'DKK' and old['price'] > 0:
-                            counts['changed_over_25_percent'] += abs(p['price_dkk'] / old['price'] - 1) > .25
+                        if p and old and old['price'] > 0:
+                            rate = {**RATES, 'USD': 6.9}.get(old['currency'])
+                            if rate:
+                                counts['changed_over_25_percent'] += abs(p['price_dkk'] / (old['price'] * rate) - 1) > .25
+                            else:
+                                counts['change_comparison_unavailable'] += 1
                         if args.apply and p:
                             cli.set_price(g['wine']['wine_id'], g['vintage'], p['price_dkk'], p['source'], p['somm_notes'])
+                        counts['priced' if p else 'ukendt'] += 1
                         report.write(json.dumps(result, ensure_ascii=False) + '\n')
                         report.flush()
-                    except (Exception, SystemExit):
+                        print(f'{i+1}/{len(targets)} {g["wine"].get("producer")} {g["wine"].get("name")} {g["vintage"]}: {result["band"]}', flush=True)
+                    except (Exception, SystemExit) as exc:
                         counts['failures'] += 1
-                        report.write(json.dumps({'wine_id': g['wine']['wine_id'], 'error': 'lookup/write failed'}) + '\n')
+                        report.write(json.dumps({'wine_id': g['wine']['wine_id'], 'vintage': g['vintage'], 'producer': g['wine'].get('producer'), 'name': g['wine'].get('name'), 'error': type(exc).__name__}) + '\n')
                         report.flush()
                     if args.apply and i + 1 < len(targets):
                         time.sleep(max(0, 120 - (time.monotonic() - started)))

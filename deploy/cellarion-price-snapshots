@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Read-only complete WineVintagePrice export via the existing Coolify Mongo container."""
+import argparse
+import datetime as dt
+import json
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+UUID = 'spuypiijq4qrcd0mzkfpm0qd'
+QUERY = '''
+const prices = db.winevintageprices.find({}, {
+  wineDefinition: 1, vintage: 1, price: 1, currency: 1, setAt: 1, createdAt: 1
+}).toArray().map(p => ({
+  wine_id: String(p.wineDefinition), vintage: String(p.vintage), price: p.price,
+  currency: p.currency || "USD",
+  set_at: (p.setAt || p.createdAt || p._id.getTimestamp()).toISOString()
+}));
+print(JSON.stringify({as_of: new Date().toISOString(), complete: true,
+  collection: "winevintageprices", count: prices.length, prices}));
+'''
+
+
+def export():
+    running = subprocess.run(['docker', 'ps', '--format', '{{.Names}}'],
+                             check=True, capture_output=True, text=True, timeout=30)
+    matches = [n for n in running.stdout.splitlines() if re.fullmatch(r'mongo-' + re.escape(UUID) + r'-.+', n)]
+    if len(matches) != 1:
+        raise ValueError('no unique running Cellarion Mongo container')
+    result = subprocess.run(['docker', 'exec', matches[0], 'mongosh', '--quiet', '--norc',
+                             'winecellar', '--eval', QUERY],
+                            check=True, capture_output=True, text=True, timeout=120)
+    data = json.loads(result.stdout)
+    if data.get('complete') is not True or data.get('collection') != 'winevintageprices' or data.get('count') != len(data['prices']):
+        raise ValueError('incomplete price export')
+    for row in data['prices']:
+        if not re.fullmatch('[0-9a-f]{24}', row['wine_id']) or not isinstance(row['vintage'], str):
+            raise ValueError('invalid wine/vintage in export')
+        if not isinstance(row['price'], (float, int)) or not math.isfinite(row['price']) or row['price'] < 0:
+            raise ValueError('invalid exported price')
+        if not re.fullmatch('[A-Z]{3}', row['currency']):
+            raise ValueError('invalid exported currency')
+        if dt.datetime.fromisoformat(row['set_at'].replace('Z', '+00:00')).tzinfo is None:
+            raise ValueError('export timestamp missing timezone')
+    return data
+
+
+def write_atomic(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                         prefix='.price-snapshots-', delete=False) as stream:
+            temporary = Path(stream.name)
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump(data, stream, ensure_ascii=False)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--notify-failure', action='store_true', help='send one Telegram line on export failure')
+    parser.add_argument('--output', help='atomic private file; defaults to stdout')
+    args = parser.parse_args()
+    os.umask(0o077)
+    try:
+        data = export()
+        if args.output:
+            write_atomic(args.output, data)
+        else:
+            print(json.dumps(data, ensure_ascii=False))
+    except Exception:
+        # subprocess stderr may contain infrastructure details; keep journal safe.
+        print('cellarion-price-snapshots: export failed; no complete file published', file=sys.stderr)
+        if args.notify_failure:
+            env = dict(os.environ)
+            env['PATH'] = str(Path.home() / '.openclaw/tools/node-v24.19.0/bin') + ':' + env.get('PATH', '')
+            try:
+                subprocess.run(['openclaw', 'message', 'send', '--channel', 'telegram', '--target', '802893059',
+                                '-m', 'Pricebot failed: snapshot export; see journalctl --user -u cellarion-pricebot.service'],
+                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, env=env)
+            except Exception:
+                print('cellarion-price-snapshots: Telegram alert failed', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

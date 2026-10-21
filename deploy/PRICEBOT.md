@@ -1,96 +1,146 @@
 # Rough retail wine prices (DEV-76)
 
-The CLI and runner use Cellarion data and MCP only; no application changes.
-A stored number is an estimate per 750 ml, never an invoice or an AI guess.
+These ops tools use Cellarion data and MCP, with no application patch. A price
+is a retail estimate per 750 ml, never an invoice or a model's guess.
 Bands: <125 · 125–200 · 200–300 · 300–450 · 450–700 · 700–1000 ·
-1000–1500 · 1500–2500 · >2500 DKK. At an exact boundary use the higher band.
+1000–1500 · 1500–2500 · >2500 DKK. An exact boundary uses the higher band.
 
-## Commands
+## Commands and credentials
 
 ```
 cellarion price-lookup WINE_ID --vintage 2020
-cellarion set-price WINE_ID 2020 250 --source 'skøn: shop.dk 2026-10-20' --notes '…'
+cellarion set-price WINE_ID 2020 250 --source 'skøn: shop.dk 2026-10-21' --notes '…'
 cellarion undo-last
-pricebot --output report.jsonl
+cellarion-price-snapshots --output ~/.local/state/cellarion/price-snapshots.json
+pricebot --snapshots ~/.local/state/cellarion/price-snapshots.json --output report.jsonl
 ```
 
-Lookup prints candidates and a pick; no remote write. It journals a read-only
-entry (excluded from undo). Copy `source` and `somm_notes` from the pick into
-`set-price --source ... --notes ...`; never substitute a guessed price.
-`set-price` uses **only** `~/.config/cellarion/token-pricebot` (owner-only mode),
-passes DKK explicitly, checks active bottles for invoice prices and journals
-the new snapshot. It never changes `Bottle.price`. Any invoice on the wine
-protects all its vintages, including a recorded zero. The server enforces
-somm/admin and write scope. The current token is named **Claude** and also has
-consume scope; pricebot's tool allowlist includes no consume tools. JB can
-replace it with read+write without changing the installation.
+Lookup prints candidates and the pick without remote writes. Copy the pick's
+`price_dkk`, `source` and `somm_notes` into `set-price`. No supported match is
+`ukendt`; never substitute a guessed number.
 
-`undo-last` selects the credential used by the last journalled write. Server
-undo is account-wide and time limited; inspect the app before undoing when
-another client may have written. Dry-run journal rows aren't undo units.
-`undo-last --batch` changes credentials per journalled step back to bulk_add.
+Writes use **only** `~/.config/cellarion/token-pricebot`, owned by jb and mode
+600. The current token is named **Claude**, with read+write+consume scopes;
+pricebot's tool allowlist excludes consume tools. JB can replace it with
+read+write without changing the code. The server enforces somm/admin plus
+write scope. DKK is passed explicitly. Any invoice price on an active bottle
+of the wine, including zero, protects every vintage from automation.
+`Bottle.price` is never changed.
 
-## Source and matching policy
+Lookup journals a read-only entry, excluded from undo. Price writes journal
+the snapshot ID and credential. `undo-last` selects that credential; batch
+undo switches credentials per step. Server undo is account-wide and time
+limited: inspect the app if another client may have written since. Test a
+live undo only immediately after a controlled price write, never by deleting
+bottles. Live write/undo waits for JB's spot check.
 
-Only reviewed retail domains in `cellarion_pricebot.SHOPS` can be fetched,
-including redirects. Auction, blog, review and search paths are rejected.
-News, review, marketplace, Vivino and Wine-searcher domains are absent from
-the allowlist. Never add one to improve coverage. Robots rules are respected;
-failed robots fetch, blocking and captchas are not bypassed. Product requests
-are at least one second apart, at most ten pages per wine.
+## Storefront discovery
 
-Accept one JSON-LD Product with explicit Offer price/currency, or
-`product:price:amount` with `product:price:currency`. No text-snippet prices,
-AggregateOffer low prices, category collections, unknown currencies or
-out-of-stock offers. Haiku via the existing Claude subscription only matches
-producer/cuvée, vintage, bottle count and size; it cannot supply a price or URL
-and has no tools. Ambiguous matches stay `ukendt`. No API keys are supplied.
+The primary path uses these shops' public search endpoints, respecting live
+robots rules and a shared limit of one request/second **per shop**. Different
+shops run concurrently. Both full producer+wine and shortened-producer
+queries always run, including when the first query found another cuvée.
 
-Prefer Danish DKK offers, then the same vintage, otherwise nearest vintage;
-prefer standard 750 ml bottles. Deduplicate domains and take up to three
-shops' median. Explicitly identified single bottles of other sizes are
-normalized to 750 ml. Notes contain n, spread, URLs, matched vintages, sizes and
-fixed conversions: EUR×7.46, SEK×0.66, NOK×0.64. Non-DKK offers are labelled
-by their original currencies and rates in notes. These are rough static
-rates, not current financial quotes. Source always starts `skøn:`.
+- Shopify suggest API: bottlehero, ottosuenson, theis-vine, finewines,
+  sydjyskvin, copenhagenwine, vinpusheren, vininvestoren. The suggest endpoint
+  returns major DKK units; do not confuse these with Shopify variant cents.
+- WooCommerce Store API: lieu-dit, pinochar, vinova, kokkensvinhus,
+  bb-vinimport, vinoman. Convert `prices.price` using `currency_minor_unit`,
+  and require explicit DKK. Skip out-of-stock, variable-price and bulk-only
+  products.
+- Own search pages: Havnens Vin and Excluwine; only their linked product
+  pages' JSON-LD Product/Offer or explicit product-price meta is used.
+  Search-page text is never a price source. At most four product pages per
+  query. The same adapters are configured for Supervin, Kjær & Sommerfeldt
+  and VildMedVin, but their search routes are currently disallowed by robots
+  (checked 2026-10-21), so those requests are skipped. Do not bypass this by
+  trying another route.
 
-## Runner and outstanding integration dependency
+Transport allows these exact search endpoints; accepted product URLs still
+pass the separate retail-product gate. News/blog/review, auction, Vivino,
+Wine-searcher and general marketplace sources remain excluded. Bottlehero's
+public product storefront is explicitly authorized by the revised brief.
+Redirects remain within reviewed domains and are checked against robots.
+Robots matching supports wildcards and `$`, including query-string bans;
+stdlib robotparser alone does not implement those rules. Missing robots.txt
+(404) permits access; other failures are not bypassed.
 
-**Do not enable the timer until the price-history input is supplied.**
-The current MCP `get_wine`/`get_bottle` responses expose no WineVintagePrice
-history or timestamps. `list_price_tracking_requests` covers requested wines
-only, and GET `/api/somm/prices/lookup` rejects personal API tokens under the
-existing route allowlist. A local journal cannot prove absence or freshness
-of snapshots written in the UI or by another client.
+SearXNG is a fallback only after no storefront pick. It accepts structured
+prices from reviewed `.dk` product pages only. An unavailable search engine
+is recorded separately as `search_unavailable`, not a lookup exception and
+not evidence that no shops stock a wine.
 
-For now `--apply` therefore requires a fresh, complete `--snapshots FILE`
-data export. Schema is in `pricebot --help`. Operations must provide that
-export from existing data tooling and refresh it before each monthly run;
-otherwise an authorized history read API is needed (outside this issue's
-no-app-patch constraint). `complete: true` is an assertion by the export
-producer, not something the runner can establish. Export age must be <=24h.
-Never fabricate an empty export to bypass this gate.
+## Matching and prices
 
-With this input, target active wine/vintages with no snapshot or a latest
-snapshot older than 180 days; skip invoice wines. One write attempt per two
-minutes. Output JSONL is durable per wine, including failures. A monthly
-Telegram summary reports priced / ukendt / >25% changes (only previous DKK
-prices are compared) / failures. A startup failure sends one failure line;
-per-wine failures are aggregated into the summary to avoid alert spam.
-No automatic write retries: a timeout could have committed a snapshot.
+Subscription Haiku selects candidate indices and vintage/size/count flags.
+Prices are excluded from its input and ignored in its output. It has no
+tools and receives no API key. Unknown vintages are labelled `unknown`;
+standard size defaults to 750 ml unless the product says otherwise.
 
-## DevOps installation after merge and input integration
+An independent conservative check requires meaningful wine-name tokens in
+the product title and producer tokens in title/vendor. Descriptions cannot
+make a neighboring cuvée pass this check. Uncertain aliases remain unknown;
+coverage is less important than accepting the wrong wine.
 
-Install `deploy/cellarion-cli` as `~/ops/bin/cellarion`, plus
-`cellarion_pricebot.py` and executable `pricebot` beside it. Install the two
-systemd unit files into `~/.config/systemd/user/`. Keep state files private.
-The existing SearXNG at 127.0.0.1:8888 and authenticated `claude` subscription
-CLI must work as user jb. OpenClaw provides the existing Telegram route.
-Run a full dry run and review the ten-price sample with JB before initial
-bulk writes. Then test one `undo-last` immediately after a controlled price
-write, before other clients write. Never delete bottles as an undo test.
+Same-vintage matches take precedence, then nearest known vintage. Prefer
+Danish DKK and standard bottles within that group. Deduplicate domains,
+choose each domain's lowest supported matching price, then take up to three
+shops' median. Notes retain n, spread, URLs, actual vintages, bottle sizes
+and fixed conversions (EUR×7.46, SEK×0.66, NOK×0.64). They are static rough
+rates, not live quotes. All prices normalize to 750 ml; `source` starts
+`skøn:` and is <=100 characters. Never truncate provenance silently.
 
-After the authoritative export is automated and validated:
+## Snapshot export and runner
+
+`cellarion-price-snapshots` resolves exactly one running
+`mongo-spuypiijq4qrcd0mzkfpm0qd-*` container with `docker ps`, then uses
+`docker exec … mongosh --quiet --norc winecellar --eval …` for a full,
+read-only `winevintageprices.find({})`. It uses the existing backup access
+path, not JB's password or a new API credential. A complete successful scan
+produces:
+
+```
+{as_of, complete: true, collection: "winevintageprices", count,
+ prices: [{wine_id, vintage, price, currency, set_at}]}
+```
+
+Output is schema-checked and atomically replaced with mode 600, after the
+entire query succeeds. On failure an old file remains intact and the command
+exits nonzero. `ExecStartPre` runs this exporter before every monthly job;
+its failure prevents the runner from starting and sends one Telegram line.
+The runner also rejects incomplete or >24-hour-old input. No local journal
+or requested-price queue is used to infer absence/freshness.
+
+Apply targets active wine/vintages with no snapshot or a latest snapshot
+older than 180 days, excluding all invoice wines. Dry runs also inspect
+invoice wines, explicitly flagged, to validate protection and coverage.
+Dry-run wine workers default to three (maximum four), sharing per-shop
+limits. Writes are always serial, about one wine every two minutes.
+
+The JSONL report contains candidates, model selection, provenance, per-shop
+errors and search availability. Durable progress is written per wine. A
+short monthly Telegram line reports priced / ukendt / >25% changes /
+failures / search availability. Previous prices use the same fixed rates
+for delta comparison, with USD×6.9 added for history; unconvertible history
+is counted separately. Startup failure sends one failure line. There are
+no automatic write retries: an ambiguous timeout could have committed.
+
+The revised target is 60% coverage; lower coverage with honest `ukendt` is
+accepted by JB. Report actual coverage and source exclusions without
+weakening identity or source rules to reach a percentage.
+
+## DevOps installation after merge and JB's ten-price check
+
+Install `deploy/cellarion-cli` as `~/ops/bin/cellarion`, and install
+`cellarion_pricebot.py`, executable `pricebot` and executable
+`cellarion-price-snapshots` beside it. Install the unit files from
+`deploy/systemd/` into `~/.config/systemd/user/`. SearXNG is optional;
+authenticated `claude` subscription CLI and the existing OpenClaw Telegram
+route must work as jb. Mongo read access must work as for cellarion-backup.
+
+Perform the full dry run, give JB ten randomly selected accepted prices
+with their URLs/bands/vintage caveats, and wait for his check before live
+writes. Then test one price write and immediate undo. Finally:
 
 ```
 systemctl --user daemon-reload
@@ -98,7 +148,10 @@ systemctl --user enable --now cellarion-pricebot.timer
 systemctl --user list-timers cellarion-pricebot.timer
 ```
 
-Inspect with `journalctl --user -u cellarion-pricebot.service`. Disable with
+The timer runs monthly, day 1 around 04:15 Europe/Copenhagen. Logs:
+`journalctl --user -u cellarion-pricebot.service`. Disable with
 `systemctl --user disable --now cellarion-pricebot.timer`.
+The intake protocol is in `deploy/INTAKE.md`.
 
-Run local checks with `python3 -m unittest discover -s deploy -p 'test_pricebot.py'`.
+Checks: `python3 -m unittest discover -s deploy -p 'test_pricebot.py'` and
+`python3 -m unittest discover -s deploy -p 'test_compose.py'`.
