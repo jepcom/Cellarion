@@ -14,10 +14,10 @@ import tempfile
 UUID = 'spuypiijq4qrcd0mzkfpm0qd'
 QUERY = '''
 const prices = db.winevintageprices.find({}, {
-  wineDefinition: 1, vintage: 1, price: 1, currency: 1, setAt: 1, createdAt: 1
+  wineDefinition: 1, vintage: 1, price: 1, currency: 1, setAt: 1, createdAt: 1, source: 1, sommNotes: 1
 }).toArray().map(p => ({
   wine_id: String(p.wineDefinition), vintage: String(p.vintage), price: p.price,
-  currency: p.currency || "USD",
+  currency: p.currency || "USD", source: p.source || null, somm_notes: p.sommNotes || null,
   set_at: (p.setAt || p.createdAt || p._id.getTimestamp()).toISOString()
 }));
 print(JSON.stringify({as_of: new Date().toISOString(), complete: true,

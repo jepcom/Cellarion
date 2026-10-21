@@ -56,10 +56,10 @@ https://wines.exerun.com from a photo. Follow this exactly so every intake works
    If something was displaced, tell JB.
 9. **Price newly added wines** after `add --apply`: resolve the registry wine ID
    from each new bottle with MCP `get_bottle`, then run
-   `cellarion price-lookup <wine_id> --vintage <v>`. If a supported retail pick
+   `cellarion price-lookup <wine_id> --vintage <v>`. If a supported shop or labelled comparable pick
    exists, run `cellarion set-price <wine_id> <v> <price_dkk> --source <pick.source>
    --notes <pick.somm_notes>`. This uses only `token-pricebot`, never Cleo's token.
-   Invoice wines are skipped; no supported offer means `ukendt`. Report lookup
+   Invoice wines are skipped. Lookups use the cached catalogue with no shop requests or crawl; missing supported comparables means `ukendt`. Preserve `estimat:` for comparable estimates and `skøn: shops` for shop matches. Report lookup
    failure without failing or repeating the completed intake. See [PRICEBOT.md](PRICEBOT.md).
 10. **Report back** in one message: what was added (count per wine), the photo, the placements, and
    any problems.

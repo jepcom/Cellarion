@@ -22,6 +22,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from cellarion_pricebot import lookup, RATES
+from cellarion_catalog import CatalogIndex, DEFAULT_CATALOGUE, refresh_catalogue, atomic_json
 
 
 def load_cli():
@@ -97,7 +98,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--apply', action='store_true')
     parser.add_argument('--snapshots', help='fresh complete WineVintagePrice data export; required for writes')
-    parser.add_argument('--output', required=True)
+    parser.add_argument('--output', default=str(DEFAULT_CATALOGUE.with_name('pricebot-monthly.jsonl')))
+    parser.add_argument('--catalogue', default=str(DEFAULT_CATALOGUE))
+    parser.add_argument('--refresh-catalogue', action='store_true', help='monthly crawl before pricing')
+    parser.add_argument('--catalogue-only', action='store_true', help='refresh without Cellarion access')
     parser.add_argument('--limit', type=int)
     parser.add_argument('--workers', type=int, default=3, help='dry-run wine workers; writes always serial')
     args = parser.parse_args()
@@ -106,6 +110,18 @@ def main():
     with output.with_suffix('.lock').open('w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
+            catalogue = None
+            try:
+                catalogue = CatalogIndex.load(args.catalogue)
+            except (OSError, ValueError, KeyError):
+                pass
+            month = dt.datetime.now(dt.timezone.utc).strftime('%Y-%m')
+            if args.refresh_catalogue or args.catalogue_only or catalogue is None or catalogue.as_of[:7] != month:
+                catalogue = refresh_catalogue(args.catalogue)
+            if args.catalogue_only:
+                print(json.dumps({'catalogue_id': catalogue.catalogue_id, 'usable_rows': len(catalogue.rows),
+                                  'shops': len(catalogue.health)}))
+                return 0
             if args.apply and not args.snapshots:
                 raise ValueError('--snapshots export required, refusing writes')
             prices = latest_prices(args.snapshots) if args.snapshots else {}
@@ -113,14 +129,31 @@ def main():
             cli.TOKEN_FILE = cli.PRICE_TOKEN
             # Validate before searching. Never fall back to Cleo's credential.
             cli.token()
-            targets = inventory(cli, include_invoices=not args.apply, limit=args.limit if not args.apply else None)
-            targets = [g for g in targets if not args.snapshots or due(prices.get((g['wine']['wine_id'], g['vintage'])))]
+            targets = inventory(cli, include_invoices=True, limit=args.limit if not args.apply else None)
             if args.limit:
                 targets = targets[:args.limit]
-            counts = dict(priced=0, ukendt=0, changed_over_25_percent=0, failures=0, search_unavailable=0, change_comparison_unavailable=0, invoice_protected=sum(g['invoice'] for g in targets))
+            atomic_json(output.with_suffix('.inventory.json'), {
+                'as_of': dt.datetime.now(dt.timezone.utc).isoformat(), 'wines': targets})
+            counts = dict(shop_priced=0, estimated=0, other_stored=0, fresh_skipped=0, written=0, ukendt=0, changed_over_25_percent=0, failures=0, change_comparison_unavailable=0, invoice_protected=sum(g['invoice'] for g in targets))
             def inspect(g):
                 try:
-                    return lookup(g['wine'], g['vintage'])
+                    if g['invoice']:
+                        return {'wine_id': g['wine']['wine_id'], 'producer': g['wine'].get('producer'),
+                                'name': g['wine'].get('name'), 'vintage': g['vintage'], 'kind': 'invoice',
+                                'band': 'invoice', 'pick': None, 'invoice_protected': True}
+                    old = prices.get((g['wine']['wine_id'], g['vintage']))
+                    if old and not due(old):
+                        source = old.get('source') or ''
+                        kind = 'estimate' if source.startswith('estimat:') else ('shop' if source.startswith('skøn:') else 'stored')
+                        rate = {**RATES, 'USD': 6.9}.get(old['currency'])
+                        from cellarion_pricebot import band
+                        return {'wine_id': g['wine']['wine_id'], 'producer': g['wine'].get('producer'),
+                                'name': g['wine'].get('name'), 'vintage': g['vintage'], 'kind': kind,
+                                'band': band(old['price'] * rate if rate else None), 'pick': None,
+                                'action': 'fresh_skipped', 'stored_price': old}
+                    result = lookup(g['wine'], g['vintage'], catalogue)
+                    result['action'] = 'lookup'
+                    return result
                 except Exception as exc:
                     return {'error': type(exc).__name__}
             if not 1 <= args.workers <= 4:
@@ -130,23 +163,27 @@ def main():
                 results = (None for _ in targets) if args.apply else executor.map(inspect, targets)
                 for i, (g, prepared) in enumerate(zip(targets, results)):
                     started = time.monotonic()
+                    result = {'action': 'lookup'}
                     try:
-                        result = lookup(g['wine'], g['vintage']) if args.apply else prepared
+                        result = inspect(g) if args.apply else prepared
                         if result.get('error'):
                             raise RuntimeError(result['error'])
                         result['invoice_protected'] = g['invoice']
                         p = result['pick']
-                        counts['search_unavailable'] += result.get('search_unavailable', False)
                         old = prices.get((g['wine']['wine_id'], g['vintage']))
                         if p and old and old['price'] > 0:
                             rate = {**RATES, 'USD': 6.9}.get(old['currency'])
                             if rate:
-                                counts['changed_over_25_percent'] += abs(p['price_dkk'] / (old['price'] * rate) - 1) > .25
+                                result['change_over_25_percent'] = abs(p['price_dkk'] / (old['price'] * rate) - 1) > .25
+                                counts['changed_over_25_percent'] += result['change_over_25_percent']
                             else:
                                 counts['change_comparison_unavailable'] += 1
                         if args.apply and p:
                             cli.set_price(g['wine']['wine_id'], g['vintage'], p['price_dkk'], p['source'], p['somm_notes'])
-                        counts['priced' if p else 'ukendt'] += 1
+                            counts['written'] += 1
+                        if result['kind'] != 'invoice':
+                            counts[{'shop':'shop_priced', 'estimate':'estimated', 'unknown':'ukendt', 'stored':'other_stored'}[result['kind']]] += 1
+                        counts['fresh_skipped'] += result.get('action') == 'fresh_skipped'
                         report.write(json.dumps(result, ensure_ascii=False) + '\n')
                         report.flush()
                         print(f'{i+1}/{len(targets)} {g["wine"].get("producer")} {g["wine"].get("name")} {g["vintage"]}: {result["band"]}', flush=True)
@@ -154,8 +191,17 @@ def main():
                         counts['failures'] += 1
                         report.write(json.dumps({'wine_id': g['wine']['wine_id'], 'vintage': g['vintage'], 'producer': g['wine'].get('producer'), 'name': g['wine'].get('name'), 'error': type(exc).__name__}) + '\n')
                         report.flush()
-                    if args.apply and i + 1 < len(targets):
+                    if args.apply and result.get('action') == 'lookup' and i + 1 < len(targets):
                         time.sleep(max(0, 120 - (time.monotonic() - started)))
+            # Retain evidence for the existing day-2 review autopilot.
+            run_at = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+            archive = output.parent / 'pricebot-runs'
+            archive.mkdir(parents=True, exist_ok=True, mode=0o700)
+            (archive / (run_at + '.jsonl')).write_bytes(output.read_bytes())
+            atomic_json(archive / (run_at + '-summary.json'), {
+                'as_of': dt.datetime.now(dt.timezone.utc).isoformat(), 'dry_run': not args.apply,
+                'counts': counts, 'catalogue_id': catalogue.catalogue_id, 'catalogue_as_of': catalogue.as_of,
+                'catalogue_health': catalogue.health, 'active_targets': len(targets)})
             summary = 'Pricebot: ' + ', '.join(f'{k}={v}' for k, v in counts.items())
             print(summary)
             if args.apply:

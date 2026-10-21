@@ -1,0 +1,172 @@
+{
+  "shops": [
+    {
+      "domain": "bottlehero.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "bottleswithhistory.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "callmewine.dk",
+      "platform": "shopify",
+      "enabled": false,
+      "reason": "Excluded by supplied catalogue brief; re-enable only after review of robots/platform"
+    },
+    {
+      "domain": "caspersvine.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "cavissima.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "copenhagenwine.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "dahlsvinhandel.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "denflaskehalsenpegerpaa.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "espergaerdevin.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "finewines.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "haslevvingaard.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "laudrup.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "ottosuenson.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "sydjyskvin.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "theis-vine.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "victoriavine.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "vineonline.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "vinhuset.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "vininvestoren.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "vinpusheren.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "vinselskabet-connaisseur.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "winetales.dk",
+      "platform": "shopify"
+    },
+    {
+      "domain": "bb-vinimport.dk",
+      "platform": "woo"
+    },
+    {
+      "domain": "benconivinimport.dk",
+      "platform": "woo"
+    },
+    {
+      "domain": "born-wine.dk",
+      "platform": "woo"
+    },
+    {
+      "domain": "champagnekaelderen.dk",
+      "platform": "woo"
+    },
+    {
+      "domain": "clemmensenwine.dk",
+      "platform": "woo"
+    },
+    {
+      "domain": "dengyldneloeve.dk",
+      "platform": "woo"
+    },
+    {
+      "domain": "gobivin.dk",
+      "platform": "woo"
+    },
+    {
+      "domain": "havnensvinotek.dk",
+      "platform": "woo"
+    },
+    {
+      "domain": "kokkensvinhus.dk",
+      "platform": "woo"
+    },
+    {
+      "domain": "lieu-dit.dk",
+      "platform": "woo"
+    },
+    {
+      "domain": "nichevine.dk",
+      "platform": "woo",
+      "enabled": false,
+      "reason": "Excluded by supplied catalogue brief; re-enable only after review of robots/platform"
+    },
+    {
+      "domain": "ravelinen.dk",
+      "platform": "woo",
+      "enabled": false,
+      "reason": "Excluded by supplied catalogue brief; re-enable only after review of robots/platform"
+    },
+    {
+      "domain": "vinoble.dk",
+      "platform": "woo"
+    },
+    {
+      "domain": "vinoman.dk",
+      "platform": "woo",
+      "enabled": false,
+      "reason": "Excluded by supplied catalogue brief; re-enable only after review of robots/platform"
+    },
+    {
+      "domain": "vinova.dk",
+      "platform": "woo"
+    },
+    {
+      "domain": "wine4u.dk",
+      "platform": "woo"
+    },
+    {
+      "domain": "winesomm.dk",
+      "platform": "woo"
+    }
+  ],
+  "excluded": {
+    "laudrupvin.dk": "duplicate redirect to canonical laudrup.dk",
+    "gastromad.dk": "food blog, not an approved wine retailer"
+  }
+}

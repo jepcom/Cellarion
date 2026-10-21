@@ -5,7 +5,7 @@ Talks to Cellarion's MCP endpoint with a personal API token (scopes read+write+c
 is read from ~/.config/cellarion/token (must be mode 600) and only ever sent as a header; it never
 appears on a command line or in output. Every command prints JSON.
 
-  cellarion price-lookup <wine_id> [--vintage V]  dry run: structured retail offers and pick
+  cellarion price-lookup <wine_id> [--vintage V]  cached shop match or labelled comparable estimate
   cellarion set-price <wine_id> <vintage> <dkk> --source SOURCE [--notes TEXT]
                                               estimate via dedicated pricebot token, currency DKK
   cellarion ping                              token works? (whoami + token scopes)
@@ -301,10 +301,20 @@ def invoice_present(wine_id):
 
 
 def set_price(wine_id, vintage, amount, source, notes=""):
-    if not math.isfinite(amount) or amount <= 0 or len(source) > 100 or not source.startswith("skøn: "):
-        die("price must be positive and finite; source must start with 'skøn: ' and be <=100 characters", 2)
+    if (not math.isfinite(amount) or amount <= 0 or len(source) > 100 or
+            not source.startswith(("skøn: shops ", "estimat: sammenlignelige "))):
+        die("positive finite price and a shops/comparables source (<=100 chars) required", 2)
     if len(notes) > 2000:
         die("somm_notes exceeds 2000 characters", 2)
+    if source.startswith("estimat:"):
+        try:
+            evidence = json.loads(notes)
+        except ValueError:
+            die("comparable estimates require JSON somm_notes evidence", 2)
+        if (not isinstance(evidence, dict) or evidence.get("method") != "comparables" or
+                not evidence.get("basis") or not evidence.get("cited_comparables") or
+                evidence.get("not_a_shop_price") is not True):
+            die("comparable estimates require basis, catalogue references and explicit labelling", 2)
     if invoice_present(wine_id):
         die("invoice price exists for this wine; skipping estimate")
     result = price_mcp("set_vintage_price", {"wine_id": wine_id, "vintage": vintage,
@@ -326,7 +336,10 @@ def main(argv):
             die("usage: cellarion price-lookup <wine_id> [--vintage V]", 2)
         from cellarion_pricebot import lookup
         wine = mcp("get_wine", {"wine_id": argv[0]}).get("data", {})
-        result = lookup(wine, vintage)
+        try:
+            result = lookup(wine, vintage)
+        except Exception as exc:
+            die(f"cached price lookup failed ({type(exc).__name__}); check the catalogue and subscription CLI")
         journal_add("price_lookup", "dry run; no remote change", wine_id=argv[0], vintage=vintage,
                     read_only=True)
         out(result)

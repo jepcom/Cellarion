@@ -1,3 +1,4 @@
+"""Catalogue, provenance, vintage and write-safety contracts (no live writes)."""
 import datetime as dt
 import importlib.machinery
 import importlib.util
@@ -5,281 +6,324 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+import cellarion_catalog as c
 import cellarion_pricebot as p
 
 
 def load(name, file):
     loader = importlib.machinery.SourceFileLoader(name, str(Path(__file__).with_name(file)))
     spec = importlib.util.spec_from_loader(name, loader)
-    mod = importlib.util.module_from_spec(spec)
-    loader.exec_module(mod)
-    return mod
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
 
 
 cli = load('cli', 'cellarion-cli')
 runner = load('runner', 'pricebot')
 exporter = load('exporter', 'cellarion-price-snapshots')
-URL = 'https://www.supervin.dk/example-2020'
+WINE = {'wine_id': 'w', 'producer': 'Producer', 'name': 'Reserve', 'appellation': 'Nuits Saint Georges'}
 
 
-def offer(price=200, url=URL, currency='DKK'):
-    return dict(name='Producer Cuvee 2020 75 cl', price=price, url=url, currency=currency, kind='jsonld')
+def row(price=200, shop='bottlehero.dk', name='Producer Reserve 2020', **extra):
+    return dict(name=name, vendor='Producer', type='wine', price=price, currency='DKK', ml=750,
+                available=True, url=f'https://{shop}/products/{name.replace(" ", "-")}',
+                row_id=f'{shop}:{name}', kind='shopify', **extra)
 
 
-class PricebotTests(unittest.TestCase):
-    def test_source_gate(self):
-        for url in ('https://dba.dk/a', 'https://wine-searcher.com/a', 'https://vivino.com/a',
-                    'https://supervin.dk.evil.com/a', 'https://supervin.dk/auction/a',
-                    'https://supervin.dk/blog/a', 'http://supervin.dk/a'):
-            self.assertFalse(p.allowed(url), url)
-        self.assertTrue(p.allowed(URL))
+def index(rows):
+    return c.CatalogIndex(dict(as_of=dt.datetime.now(dt.timezone.utc).isoformat(), catalogue_id='test', shops=[], rows=rows))
 
-    def test_structured_product_only(self):
-        page = '<script type="application/ld+json">' + json.dumps({'@type': 'Product', 'name': 'Wine',
-            'offers': {'@type': 'Offer', 'price': '1.234,50', 'priceCurrency': 'DKK'}}) + '</script>'
-        self.assertEqual(p.extract(page, URL)[0]['price'], 1234.5)
-        self.assertEqual(p.extract('Wine costs 200 kr', URL), [])
-        self.assertEqual(p.extract(page, 'https://dba.dk/a'), [])
-        self.assertEqual(p.extract(page.replace('Offer"', 'AggregateOffer"'), URL), [])
-        self.assertEqual(p.extract(page.replace('"priceCurrency"', '"unknownCurrency"'), URL), [])
 
-    def test_meta_order_and_currency(self):
-        page = '<title>Wine</title><meta content="100" property="product:price:amount"><meta property="product:price:currency" content="EUR">'
-        self.assertEqual(p.extract(page, URL)[0]['currency'], 'EUR')
-        self.assertEqual(p.extract(page.replace('EUR', '?'), URL), [])
+def model_match(i=0, vintage='2020', ml=750):
+    return dict(index=i, vintage=vintage, ml=ml, bottles=1)
 
-    def test_median_distinct_shops_and_vintage(self):
-        c = [offer(100), offer(999), offer(300, 'https://jyskvin.dk/wine'), offer(200, 'https://juuls.dk/wine')]
-        matches = [dict(index=i, vintage='2020', ml=750, bottles=1) for i in range(4)]
-        result = p.choose(c, matches, '2020')
-        self.assertEqual(result['price_dkk'], 200)
-        self.assertEqual(len(result['offers']), 3)
-        self.assertIn('median 3 shops', result['source'])
-        self.assertEqual(json.loads(result['somm_notes'])['spread_dkk'], [100, 300])
 
-    def test_nearest_and_foreign_conversion(self):
-        c = [offer(100, 'https://vineshop24.de/wine', 'EUR'), offer(500)]
-        m = [dict(index=0, vintage='2020', ml=750, bottles=1), dict(index=1, vintage='2019', ml=750, bottles=1)]
-        self.assertEqual(p.choose(c, m, '2020')['price_dkk'], 746)  # Exact vintage first
-        self.assertEqual(p.choose(c[:1], m[:1], '2020')['price_dkk'], 746)
-        self.assertIsNone(p.choose(c, [dict(index=500)], '2020'))
-        self.assertIsNone(p.choose(c, [dict(index=0, vintage='2020', ml=750, bottles=6)], '2020'))
+def shopify_product(i=1):
+    return dict(id=i, title='Producer Reserve 2020', vendor='Producer', handle=f'wine-{i}',
+                product_type='Wine', variants=[dict(id=i, title='75 cl', price='159.50', available=True)])
 
-    def test_invoice_protection_even_missing_search_id(self):
-        def api(tool, args=None):
-            if tool == 'get_wine':
-                return {'data': {'name': 'Wine', 'producer': 'Producer'}}
-            if tool == 'get_bottle':
-                return {'data': {'price': 100}}
-            return {'data': [{'bottle_id': 'b', 'wine': {'name': 'Wine', 'producer': 'Producer'}, 'price': None}], 'page': {'total': 1}}
-        with patch.object(cli, 'price_mcp', side_effect=api):
-            self.assertTrue(cli.invoice_present('wine'))
 
-    def test_write_currency_journal_and_credential(self):
-        with patch.object(cli, 'invoice_present', return_value=False), patch.object(cli, 'price_mcp', return_value={'data': {'price_entry_id': 'p'}}) as rpc, patch.object(cli, 'journal_add') as journal:
-            cli.set_price('wine', '2020', 200, 'skøn: supervin.dk 2026-10-20')
+class CatalogueTests(unittest.TestCase):
+    def test_currency_units_variants_and_sizes(self):
+        _, rows = c.parse_products('bottlehero.dk', 'shopify', {'products': [shopify_product()]})
+        self.assertEqual(rows[0]['price'], 159.5)
+        self.assertEqual(rows[0]['ml'], 750)
+        woo = dict(id=1, name='Reserve 0,375 l', permalink='https://vinova.dk/wine', is_in_stock=True,
+                   prices=dict(price='15950', currency_code='DKK', currency_minor_unit=2))
+        _, rows = c.parse_products('vinova.dk', 'woo', [woo])
+        self.assertEqual(rows[0]['price'], 159.5)
+        self.assertEqual(rows[0]['ml'], 375)
+        _, rows = c.parse_products('vinova.dk', 'woo', [{**woo, 'prices': {**woo['prices'], 'currency_code': 'USD'}}])
+        self.assertEqual(rows, [])
+        self.assertEqual(c.size_ml('1.5 l'), 1500)
+        self.assertEqual(c.size_ml('Magnum'), 1500)
+        self.assertEqual(c.size_ml('750ml'), 750)
+
+    def test_robots_wildcards_query_and_bot_specific_rules(self):
+        robot = c.Robots('User-agent: *\nDisallow: /*?\nAllow: /public?yes\nDisallow: /private$\n')
+        self.assertFalse(robot.can_fetch('https://nichevine.dk/products.json?limit=250'))
+        self.assertTrue(robot.can_fetch('https://nichevine.dk/public?yes'))
+        self.assertFalse(robot.can_fetch('https://nichevine.dk/private'))
+        self.assertTrue(robot.can_fetch('https://nichevine.dk/private-wine'))
+        specific = c.Robots('User-agent: *\nDisallow: /\nUser-agent: CellarionPricebot\nAllow: /\nCrawl-delay: 2\n')
+        self.assertTrue(specific.can_fetch('https://bottlehero.dk/products.json'))
+        self.assertEqual(specific.delay, 2)
+
+    def test_source_and_pack_gate(self):
+        for url in ('https://wine-searcher.com/w', 'https://dba.dk/w', 'https://vivino.com/w',
+                    'https://bottlehero.dk.evil.test/w', 'https://bottlehero.dk/blog/w', 'http://bottlehero.dk/w'):
+            self.assertFalse(c.allowed_product(url), url)
+        self.assertTrue(c.is_pack('6 flasker Reserve'))
+        self.assertTrue(c.is_pack('6x 75cl'))
+        self.assertTrue(c.is_pack('12 x 75 cl'))
+        self.assertTrue(c.is_pack('3x20CL'))
+        self.assertFalse(c.is_pack('1 x 750 ml'))
+        self.assertFalse(c.is_pack('2016 Reserve 750 ml'))
+        self.assertEqual(index([row(name='6 flasker Producer Reserve 2020')]).rows, [])
+
+    def test_complete_pagination_and_no_repeated_or_capped_pages(self):
+        products = [shopify_product(i) for i in range(250)]
+        fake = Mock()
+        fake.get.side_effect = [{'products': products}, {'products': []}]
+        rows, health = c.crawl_shop('bottlehero.dk', 'shopify', fake)
+        self.assertEqual(len(rows), 250)
+        self.assertEqual(health['status'], 'ok')
+        self.assertEqual(health['pages'], 2)
+        fake.get.side_effect = [{'products': products}, {'products': products}]
+        rows, health = c.crawl_shop('bottlehero.dk', 'shopify', fake)
+        self.assertEqual(rows, [])
+        self.assertEqual(health['status'], 'repeated-page')
+        fake.get.side_effect = None
+        fake.get.return_value = {'products': products}
+        rows, health = c.crawl_shop('bottlehero.dk', 'shopify', fake, max_pages=1)
+        self.assertEqual(rows, [])
+        self.assertEqual(health['status'], 'page-cap')
+
+    def test_partial_failure_never_publishes_partial_prices(self):
+        fake = Mock()
+        fake.get.side_effect = [{'products': [shopify_product(i) for i in range(250)]}, TimeoutError()]
+        rows, health = c.crawl_shop('bottlehero.dk', 'shopify', fake)
+        self.assertEqual(rows, [])
+        self.assertEqual(health['status'], 'partial')
+        self.assertEqual(health['rows_seen'], 250)
+        fake.get.side_effect = PermissionError()
+        _, health = c.crawl_shop('bottlehero.dk', 'shopify', fake)
+        self.assertEqual(health['status'], 'robots-disallowed')
+
+    def test_failed_refresh_preserves_cache_and_logs_health(self):
+        fake = Mock()
+        fake.get.side_effect = PermissionError()
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / 'catalogue.json'
+            cache.write_text('old cache')
+            with patch.dict(c.SHOPS, {'bottlehero.dk': 'shopify'}, clear=True), patch('builtins.print'):
+                with self.assertRaises(ValueError):
+                    c.refresh_catalogue(cache, fake)
+            self.assertEqual(cache.read_text(), 'old cache')
+            health = json.loads(cache.with_name('catalogue-health.jsonl').read_text().splitlines()[0])
+            self.assertEqual(health['status'], 'robots-disallowed')
+
+    def test_local_retrieval_and_own_row_exclusion(self):
+        cat = index([row(), row(name='Producer Basic 2020'), row(shop='finewines.dk', name='Other Nuits Saint Georges 2021')])
+        candidates = cat.candidates(WINE)
+        self.assertEqual(candidates[0]['name'], 'Producer Reserve 2020')
+        comps = cat.comparables(WINE, exclude=[candidates[0]['row_id']])
+        self.assertTrue(any('Basic' in r['name'] for r in comps))
+        self.assertTrue(any('Nuits' in r['name'] for r in comps))
+        self.assertTrue(all(r['row_id'] != candidates[0]['row_id'] for r in comps))
+        self.assertEqual(cat.comparables({'producer': '', 'name': 'wine'}), [])
+
+    def test_stale_cache_and_atomic_private_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / 'catalogue.json'
+            c.atomic_json(cache, dict(schema_version=1, as_of=(dt.datetime.now(dt.timezone.utc)-dt.timedelta(days=41)).isoformat()))
+            self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
+            with self.assertRaises(ValueError):
+                c.CatalogIndex.load(cache)
+
+    def test_shared_per_shop_request_rate_includes_www_alias(self):
+        fetcher = c.Fetcher()
+        clock = [100.0]
+        with patch.object(c.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(c.time, 'sleep', side_effect=lambda n: clock.__setitem__(0, clock[0]+n)) as sleep:
+            fetcher.throttle('https://bottlehero.dk/products.json')
+            fetcher.throttle('https://www.bottlehero.dk/products.json')
+            fetcher.throttle('https://finewines.dk/products.json')
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0, 1, 0])
+
+
+class MatchingTests(unittest.TestCase):
+    def test_exact_vintage_for_defined_or_old_wines(self):
+        for name in ('Colheita Porto', 'Vintage Port', 'Late Bottled Vintage Porto', 'Madeira'):
+            self.assertFalse(p.vintage_allowed({'name': name}, '2020', '2021', year=2026))
+            self.assertTrue(p.vintage_allowed({'name': name}, '2020', '2020', year=2026))
+        self.assertFalse(p.vintage_allowed({'name':'Wine'}, '2009', '2010', year=2026))
+        self.assertFalse(p.vintage_allowed({'name':'Wine'}, '2020', '2024', year=2026))
+        self.assertTrue(p.vintage_allowed({'name':'Wine'}, '2020', '2023', year=2026))
+        self.assertFalse(p.vintage_allowed({'name':'Wine'}, '2020', 'unknown', year=2026))
+
+    def test_median_distinct_shops_and_code_owned_prices(self):
+        rows = [row(100), row(300, 'finewines.dk'), row(900)]
+        cat = index(rows)
+        matches = [model_match(i) | {'price_dkk': 1} for i in range(3)]
+        pick = p.choose(WINE, rows, matches, '2020', cat)
+        self.assertEqual(pick['price_dkk'], 200)
+        self.assertEqual(pick['kind'], 'shop')
+        self.assertTrue(pick['source'].startswith('skøn: shops 2 '))
+        self.assertEqual(json.loads(pick['somm_notes'])['spread_dkk'], [100, 300])
+
+    def test_unknown_or_hallucinated_vintage_cannot_be_shop_price(self):
+        rows = [row()]
+        self.assertIsNone(p.choose(WINE, rows, [model_match(vintage='2022')], '2022', index(rows)))
+        self.assertIsNone(p.choose(WINE, rows, [model_match(vintage=None)], '2020', index(rows)))
+        self.assertEqual(p.validated_matches(WINE, rows, [model_match(100)]), [])
+
+    def test_neighboring_cuvee_and_reserve_tier_rejected(self):
+        self.assertFalse(p.identity_matches({'producer':'Producer','name':'Basic'}, row(name='Producer Reserve')))
+        self.assertFalse(p.identity_matches({'producer':'Producer','name':'Brunello di Montalcino'}, row(name='Producer Brunello di Montalcino Riserva')))
+        self.assertFalse(p.identity_matches({'producer':'Producer','name':'Cuvee Mon Aieul'}, row(name='Producer Reserve Deux Freres')))
+
+    def test_size_comes_from_catalogue_when_known(self):
+        half = row()
+        half['ml'] = 375
+        pick = p.choose(WINE, [half], [model_match(ml=750)], '2020', index([half]))
+        self.assertEqual(pick['price_dkk'], 400)
+
+    def test_comparable_estimate_label_references_no_confidence_range(self):
+        comps = [{**row(name='Producer Basic 2020'), 'relation':'same_producer'}]
+        with patch.object(p, 'ask_json', return_value={'estimate_dkk': 350, 'low': 300, 'high': 400,
+                         'basis':'Same producer, higher cuvee level.', 'comparable_indices':[0]}):
+            pick = p.estimate(WINE, '2010', comps, index(comps))
+        self.assertEqual(pick['kind'], 'estimate')
+        self.assertTrue(pick['source'].startswith('estimat: sammenlignelige '))
+        notes = json.loads(pick['somm_notes'])
+        self.assertTrue(notes['not_a_shop_price'])
+        self.assertEqual(notes['cited_comparables'][0]['url'], comps[0]['url'])
+        self.assertNotIn('low', pick)
+        self.assertNotIn('confidence', notes)
+
+    def test_no_comparables_or_invented_reference_means_unknown(self):
+        with patch.object(p, 'ask_json') as ask:
+            self.assertIsNone(p.estimate(WINE, '2020', [], index([])))
+            ask.assert_not_called()
+        comps = [{**row(), 'relation':'same_producer'}]
+        with patch.object(p, 'ask_json', return_value={'estimate_dkk': 500, 'basis':'Guess', 'comparable_indices':[40]}):
+            self.assertIsNone(p.estimate(WINE, '2020', comps, index(comps)))
+
+    def test_intake_lookup_never_fetches_or_refreshes_catalogue(self):
+        cat = index([row()])
+        with patch.object(c.Fetcher, 'get', side_effect=AssertionError('no shop requests')), patch.object(c, 'refresh_catalogue', side_effect=AssertionError('no crawl')), patch.object(p, 'ask_json', return_value={'matches':[model_match()]}):
+            result = p.lookup(WINE, '2020', cat)
+        self.assertEqual(result['kind'], 'shop')
+
+    def test_old_other_vintage_goes_to_comparables_not_shop(self):
+        wine = {**WINE, 'name':'Colheita Porto'}
+        own = row(name='Producer Colheita Porto 1978')
+        other = row(name='Producer Tawny Porto 2000')
+        cat = index([own,other])
+        def ask(prompt):
+            if '"matches"' in prompt:
+                candidates = cat.candidates(wine)
+                return {'matches':[model_match(next(i for i,r in enumerate(candidates) if r['name']==own['name']), '1978')]}
+            return {'estimate_dkk':3500, 'basis':'Aged producer Port comparables, older target vintage.', 'comparable_indices':[0]}
+        with patch.object(p, 'ask_json', side_effect=ask):
+            result = p.lookup(wine, '1937', cat)
+        self.assertEqual(result['kind'], 'estimate')
+        self.assertEqual(result['pick']['price_dkk'], 3500)
+        self.assertTrue(all(x['row_id'] != own['row_id'] for x in result['comparables']))
+
+
+class WriteAndSnapshotTests(unittest.TestCase):
+    def test_pricebot_cannot_call_consume_tools(self):
+        with patch.object(cli, 'mcp') as rpc:
+            with self.assertRaises(SystemExit): cli.price_mcp('consume_bottle')
+            rpc.assert_not_called()
+
+    def test_invoice_protection_currency_and_journal(self):
+        with patch.object(cli, 'invoice_present', return_value=True), patch.object(cli, 'price_mcp') as rpc:
+            with self.assertRaises(SystemExit): cli.set_price('w','2020',200,'skøn: shops 1 2026-10-21')
+            rpc.assert_not_called()
+        with patch.object(cli, 'invoice_present', return_value=False), patch.object(cli, 'price_mcp', return_value={'data':{'price_entry_id':'p'}}) as rpc, patch.object(cli, 'journal_add') as journal:
+            cli.set_price('w','2020',200,'skøn: shops 1 2026-10-21')
             self.assertEqual(rpc.call_args.args[1]['currency'], 'DKK')
             self.assertEqual(journal.call_args.kwargs['credential'], 'pricebot')
-        with patch.object(cli, 'invoice_present', return_value=True), patch.object(cli, 'price_mcp') as rpc:
-            with self.assertRaises(SystemExit):
-                cli.set_price('wine', '2020', 200, 'skøn: test')
-            rpc.assert_not_called()
-        with patch.object(cli, 'mcp') as rpc:
-            with self.assertRaises(SystemExit):
-                cli.price_mcp('consume_bottle')
-            rpc.assert_not_called()
 
-    def test_staleness_and_complete_export(self):
-        now = dt.datetime.now(dt.timezone.utc)
-        self.assertTrue(runner.due(None, now))
-        self.assertFalse(runner.due({'set_at': (now - dt.timedelta(days=180)).isoformat()}, now))
-        self.assertTrue(runner.due({'set_at': (now - dt.timedelta(days=181)).isoformat()}, now))
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'prices.json'
-            path.write_text(json.dumps({'as_of': now.isoformat(), 'complete': False, 'prices': []}))
-            with self.assertRaises(ValueError):
-                runner.latest_prices(path)
+    def test_estimate_cannot_be_written_without_evidence(self):
+        with patch.object(cli, 'price_mcp') as rpc:
+            with self.assertRaises(SystemExit): cli.set_price('w','2020',300,'estimat: sammenlignelige 2026-10-21')
+            rpc.assert_not_called()
+        notes=json.dumps(dict(method='comparables',not_a_shop_price=True,basis='Same producer',cited_comparables=[{'url':'https://finewines.dk/products/basic'}]))
+        with patch.object(cli, 'invoice_present', return_value=False), patch.object(cli, 'price_mcp', return_value={'data':{}}) as rpc, patch.object(cli, 'journal_add'):
+            cli.set_price('w','2020',300,'estimat: sammenlignelige 2026-10-21',notes)
+            self.assertTrue(rpc.call_args.args[1]['source'].startswith('estimat:'))
 
-    def test_undo_ignores_lookup_and_uses_pricebot_token(self):
-        rows = [{'tool': 'set_vintage_price', 'credential': 'pricebot'},
-                {'tool': 'price_lookup', 'read_only': True}]
-        previous = cli.TOKEN_FILE
+    def test_undo_ignores_lookup_and_uses_dedicated_token(self):
+        rows=[{'tool':'set_vintage_price','credential':'pricebot'},{'tool':'price_lookup','read_only':True}]
+        previous=cli.TOKEN_FILE
         try:
-            with patch.object(cli, 'journal_read', return_value=rows), patch.object(cli, 'journal_write') as write, patch.object(cli, 'mcp', return_value={'data': {'undone': 'set_vintage_price'}}) as rpc:
-                with self.assertRaises(SystemExit):
-                    cli.main(['undo-last'])
-                self.assertEqual(cli.TOKEN_FILE, cli.PRICE_TOKEN)
+            with patch.object(cli,'journal_read',return_value=rows), patch.object(cli,'journal_write') as write, patch.object(cli,'mcp',return_value={'data':{'undone':'set_vintage_price'}}) as rpc:
+                with self.assertRaises(SystemExit): cli.main(['undo-last'])
+                self.assertEqual(cli.TOKEN_FILE,cli.PRICE_TOKEN)
                 rpc.assert_called_once_with('undo_last')
                 write.assert_called_once_with([])
-        finally:
-            cli.TOKEN_FILE = previous
+        finally: cli.TOKEN_FILE=previous
 
-    def test_outage_is_not_unknown(self):
-        response = unittest.mock.MagicMock()
-        response.__enter__.return_value.read.return_value = b'{"results":[],"unresponsive_engines":[["mojeek","Suspended"]]}'
-        with patch.object(p.request, 'urlopen', return_value=response):
-            with self.assertRaises(RuntimeError):
-                p.search('wine')
-
-    def test_shopify_prices_and_source_validation(self):
-        products = [{'title': 'Wine 2020', 'price': '159.50', 'available': True,
-                     'url': '/products/wine-2020', 'vendor': 'Producer'},
-                    {'title': 'Unavailable', 'price': '100', 'available': False, 'url': '/products/old'},
-                    {'title': 'Injected', 'price': '100', 'url': 'https://dba.dk/wine'},
-                    {'title': 'Variable', 'price': '100', 'price_min': '100', 'price_max': '200', 'url': '/products/variable'}]
-        c = p.api_candidates('bottlehero.dk', {'resources': {'results': {'products': products}}})
-        self.assertEqual(len(c), 1)
-        self.assertEqual(c[0]['price'], 159.5)
-        self.assertEqual(c[0]['kind'], 'shopify')
-
-    def test_woo_minor_units_currency_and_packs(self):
-        base = dict(name='Wine', permalink='https://pinochar.dk/product/wine/', is_in_stock=True,
-                    prices={'price': '15950', 'currency_code': 'DKK', 'currency_minor_unit': 2})
-        variants = [base, {**base, 'is_in_stock': False},
-                    {**base, 'prices': {**base['prices'], 'currency_code': 'USD'}},
-                    {**base, 'add_to_cart': {'minimum': 6}}, {**base, 'type': 'variable'}]
-        c = p.api_candidates('pinochar.dk', variants)
-        self.assertEqual(len(c), 1)
-        self.assertEqual(c[0]['price'], 159.5)
-
-    def test_full_hits_still_run_short_query(self):
-        response = {'resources': {'results': {'products': [{'title': 'Different Cuvee',
-                     'price': '100', 'url': '/products/different'}]}}}
-        fetcher = unittest.mock.Mock()
-        fetcher.page.return_value = (json.dumps(response), 'https://bottlehero.dk/search/suggest.json')
-        candidates, errors = p.shop_candidates('bottlehero.dk', {'producer': 'Domaine Louis Fleurot', 'name': 'Nuits'}, fetcher)
-        self.assertEqual(len(candidates), 2)
-        self.assertEqual(fetcher.page.call_count, 2)
-        self.assertIn('q=Louis+Fleurot', fetcher.page.call_args.args[0])
-        self.assertEqual(errors, [])
-
-    def test_robots_wildcards_query_end_and_agent_rules(self):
-        r = p.Robots('User-agent: *\nDisallow: /*?\nDisallow: */sog/*\nDisallow: /private$\nAllow: /public?yes\n')
-        self.assertFalse(r.can_fetch('https://vildmedvin.dk/catalogsearch/result/?q=wine'))
-        self.assertFalse(r.can_fetch('https://kjaersommerfeldt.dk/sog/?q=wine'))
-        self.assertFalse(r.can_fetch('https://shop.dk/private'))
-        self.assertTrue(r.can_fetch('https://shop.dk/private-product'))
-        self.assertTrue(r.can_fetch('https://shop.dk/public?yes'))
-        r = p.Robots('User-agent: *\nDisallow: /\nUser-agent: CellarionPricebot\nAllow: /\nCrawl-delay: 2\n')
-        self.assertTrue(r.can_fetch(URL))
-        self.assertEqual(r.delay, 2)
-
-    def test_snapshot_container_selection_and_atomic_output(self):
-        data = {'complete': True, 'collection': 'winevintageprices', 'count': 0, 'prices': [],
-                'as_of': dt.datetime.now(dt.timezone.utc).isoformat()}
-        responses = [unittest.mock.Mock(stdout='mongo-' + exporter.UUID + '-123\nother-db\n'),
-                     unittest.mock.Mock(stdout=json.dumps(data))]
-        with patch.object(exporter.subprocess, 'run', side_effect=responses) as run:
-            self.assertEqual(exporter.export(), data)
-            command = run.call_args_list[1].args[0]
-            self.assertEqual(command[:3], ['docker', 'exec', 'mongo-' + exporter.UUID + '-123'])
-            self.assertIn('find({},', command[-1])
-            self.assertNotIn('update', command[-1])
+    def test_180_day_boundary_and_incomplete_export(self):
+        now=dt.datetime.now(dt.timezone.utc)
+        self.assertTrue(runner.due(None,now))
+        self.assertFalse(runner.due({'set_at':(now-dt.timedelta(days=180)).isoformat()},now))
+        self.assertTrue(runner.due({'set_at':(now-dt.timedelta(days=181)).isoformat()},now))
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'prices.json'
-            exporter.write_atomic(path, data)
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(json.loads(path.read_text()), data)
-        with patch.object(exporter.subprocess, 'run', return_value=unittest.mock.Mock(stdout='')):
-            with self.assertRaises(ValueError):
-                exporter.export()
+            path=Path(directory)/'snapshot.json'
+            path.write_text(json.dumps({'as_of':now.isoformat(),'complete':False,'prices':[]}))
+            with self.assertRaises(ValueError):runner.latest_prices(path)
 
-    def test_unknown_vintage_is_labelled_and_prices_stay_in_code(self):
-        c = [offer(150)]
-        result = p.choose(c, [{'index': 0, 'vintage': None, 'ml': 750, 'bottles': 1, 'price_dkk': 1}], '2020')
-        self.assertEqual(result['price_dkk'], 150)
-        self.assertFalse(json.loads(result['somm_notes'])['same_vintage'])
-        self.assertEqual(result['offers'][0]['vintage'], 'unknown')
-
-    def test_model_cannot_substitute_neighboring_cuvee(self):
-        wine = {'producer': 'Domaine Pierre Usseglio & Fils', 'name': 'Châteauneuf-du-Pape Cuvée de mon Aïeul'}
-        wrong = {**offer(999), 'name': 'Pierre Usseglio Châteauneuf-du-Pape Réserve des Deux Frères 2003',
-                 'vendor': 'Domaine Pierre Usseglio et Fils'}
-        right = {**offer(635), 'name': 'Châteauneuf-Du-Pape Cuvée De Mon Aïeul 2015', 'vendor': 'Domaine Pierre Usseglio'}
-        matches = [dict(index=0, vintage='2003', ml=750, bottles=1), dict(index=1, vintage='2015', ml=750, bottles=1)]
-        result = p.choose([wrong, right], matches, '2009', wine)
-        self.assertEqual(result['price_dkk'], 635)
-        self.assertEqual(len(result['offers']), 1)
-        self.assertFalse(p.identity_matches({'producer': 'Producer', 'name': 'Special Reserve'},
-                                           {'name': 'Producer Basic Wine', 'description': 'Unlike Special Reserve'}))
-
-    def test_lookup_outage_remains_separate_from_unknown(self):
-        with patch.object(p, 'gather', return_value=([], [])), patch.object(p, 'fallback', return_value=([], [
-                {'stage': 'searxng', 'status': 'search unavailable'}])):
-            result = p.lookup({'wine_id': 'w', 'producer': 'Producer', 'name': 'Wine'}, '2020')
-            self.assertEqual(result['band'], 'ukendt')
-            self.assertTrue(result['search_unavailable'])
-
-    def test_invoice_wines_included_only_for_readonly_validation(self):
-        fake = unittest.mock.Mock()
-        fake.price_bottles.return_value = [
-            {'bottle_id': 'a', 'wine': {'name': 'Wine', 'producer': 'Producer'}, 'vintage': '2020', 'price': 100},
-            {'bottle_id': 'b', 'wine': {'name': 'Wine', 'producer': 'Producer'}, 'vintage': '2021', 'price': None}]
-        fake.price_mcp.side_effect = lambda tool, args: {'data': {'wine': {'wine_id': 'w', 'name': 'Wine', 'producer': 'Producer'}}}
-        self.assertEqual(runner.inventory(fake), [])
-        self.assertEqual(len(runner.inventory(fake, include_invoices=True)), 2)
-
-    def test_export_failure_preserves_old_file(self):
+    def test_private_snapshot_and_unique_container_read_only(self):
+        data={'complete':True,'collection':'winevintageprices','count':0,'prices':[],'as_of':dt.datetime.now(dt.timezone.utc).isoformat()}
+        calls=[Mock(stdout='mongo-'+exporter.UUID+'-123\nother-db\n'),Mock(stdout=json.dumps(data))]
+        with patch.object(exporter.subprocess,'run',side_effect=calls) as run:
+            self.assertEqual(exporter.export(),data)
+            self.assertIn('find({},',run.call_args_list[1].args[0][-1])
+            self.assertNotIn('update',run.call_args_list[1].args[0][-1])
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'prices.json'
-            path.write_text('old')
-            with patch.object(exporter.sys, 'argv', ['snapshots', '--output', str(path)]), patch.object(exporter, 'export', side_effect=ValueError('failed')):
-                self.assertEqual(exporter.main(), 1)
-            self.assertEqual(path.read_text(), 'old')
+            path=Path(directory)/'prices.json'
+            exporter.write_atomic(path,data)
+            self.assertEqual(path.stat().st_mode & 0o777,0o600)
 
-    def test_match_input_filters_identity_and_omits_prices(self):
-        wine = {'producer': 'Producer', 'name': 'Reserve'}
-        candidates = [{**offer(500), 'name': 'Producer Basic'},
-                      {**offer(600), 'name': 'Producer Reserve 2020'}]
-        response = unittest.mock.Mock(returncode=0, stdout=json.dumps({'result': json.dumps({
-            'matches': [{'index': 1, 'vintage': '2020', 'ml': 750, 'bottles': 1}]})}))
-        with patch.object(p.subprocess, 'run', return_value=response) as run:
-            self.assertEqual(p.match(wine, candidates)[0]['index'], 1)
-            prompt = run.call_args.kwargs['input']
-            self.assertNotIn('Producer Basic', prompt)
-            self.assertNotIn('"price":', prompt)
-            self.assertIn('Producer Reserve', prompt)
-        with patch.object(p.subprocess, 'run') as run:
-            self.assertEqual(p.match(wine, candidates[:1]), [])
-            run.assert_not_called()
+    def test_monthly_fresh_prices_reported_without_model_or_writes(self):
+        cat=index([row()])
+        fake=Mock()
+        groups=[{'wine':WINE,'vintage':'2020','invoice':False},
+                {'wine':{**WINE,'wine_id':'invoice'},'vintage':'2022','invoice':True}]
+        snapshot={'as_of':dt.datetime.now(dt.timezone.utc).isoformat(),'complete':True,'prices':[
+            {'wine_id':'w','vintage':'2020','price':200,'currency':'DKK','source':'skøn: shops 1 2026-10-21',
+             'set_at':dt.datetime.now(dt.timezone.utc).isoformat()}]}
+        with tempfile.TemporaryDirectory() as directory:
+            folder=Path(directory)
+            source=folder/'snapshot.json'
+            source.write_text(json.dumps(snapshot))
+            target=folder/'run.jsonl'
+            argv=['pricebot','--apply','--snapshots',str(source),'--output',str(target)]
+            with patch.object(runner.sys,'argv',argv), patch.object(runner.CatalogIndex,'load',return_value=cat), patch.object(runner,'load_cli',return_value=fake), patch.object(runner,'inventory',return_value=groups), patch.object(runner,'lookup') as lookup, patch.object(runner,'notify'), patch('builtins.print'):
+                self.assertEqual(runner.main(),0)
+            lookup.assert_not_called()
+            fake.set_price.assert_not_called()
+            results=[json.loads(line) for line in target.read_text().splitlines()]
+            self.assertEqual(results[0]['action'],'fresh_skipped')
+            self.assertEqual(results[1]['kind'],'invoice')
+            summary=json.loads(next((folder/'pricebot-runs').glob('*summary.json')).read_text())
+            self.assertEqual(summary['counts']['shop_priced'],1)
+            self.assertEqual(summary['counts']['written'],0)
+            self.assertEqual(summary['counts']['invoice_protected'],1)
 
-    def test_per_shop_rate_state_is_shared(self):
-        fetcher = p.Fetcher()
-        clock = [100.0]
-        def sleep(seconds):
-            clock[0] += seconds
-        with patch.object(p.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(p.time, 'sleep', side_effect=sleep) as wait:
-            fetcher.throttle('https://supervin.dk/a')
-            fetcher.throttle('https://www.supervin.dk/b')
-            fetcher.throttle('https://juuls.dk/a')
-            self.assertEqual([c.args[0] for c in wait.call_args_list], [0, 1, 0])
-
-    def test_basic_wine_cannot_take_reserve_or_premier_cru_offer(self):
-        self.assertFalse(p.identity_matches({'producer': 'Livio Sassetti', 'name': 'Brunello di Montalcino'},
-                                           {'name': 'Livio Sassetti Brunello di Montalcino Riserva 2012'}))
-        self.assertFalse(p.identity_matches({'producer': 'Producer', 'name': 'Nuits-Saint-Georges'},
-                                           {'name': 'Producer Nuits-Saint-Georges 1. Cru Les Cailles'}))
-        self.assertTrue(p.identity_matches({'producer': 'Producer', 'name': 'Nuits-Saint-Georges 1er Cru Les Cailles'},
-                                          {'name': 'Producer Nuits-Saint-Georges 1. Cru Cailles'}))
-
-    def test_limited_dry_run_does_not_resolve_entire_cellar(self):
-        fake = unittest.mock.Mock()
-        fake.price_bottles.return_value = [
-            {'bottle_id': 'a', 'wine': {'name': 'Wine', 'producer': 'Producer'}, 'vintage': '2020', 'price': None},
-            {'bottle_id': 'b', 'wine': {'name': 'Wine', 'producer': 'Producer'}, 'vintage': '2021', 'price': 100}]
-        fake.price_mcp.return_value = {'data': {'wine': {'wine_id': 'w', 'name': 'Wine', 'producer': 'Producer'}}}
-        result = runner.inventory(fake, include_invoices=True, limit=1)
-        self.assertEqual(len(result), 1)
-        self.assertTrue(result[0]['invoice'])
-        fake.price_mcp.assert_called_once_with('get_bottle', {'bottle_id': 'a'})
-
-    def test_bands(self):
-        self.assertEqual(p.band(None), 'ukendt')
-        self.assertEqual(p.band(124), '<125')
-        self.assertEqual(p.band(125), '125–200')
-        self.assertEqual(p.band(2501), '>2500')
+    def test_limited_inventory_still_protects_invoice_on_other_vintage(self):
+        fake=Mock()
+        fake.price_bottles.return_value=[{'bottle_id':'a','wine':{'name':'Wine','producer':'Producer'},'vintage':'2020','price':None},
+                                         {'bottle_id':'b','wine':{'name':'Wine','producer':'Producer'},'vintage':'2021','price':100}]
+        fake.price_mcp.return_value={'data':{'wine':{'wine_id':'w','name':'Wine','producer':'Producer'}}}
+        rows=runner.inventory(fake,include_invoices=True,limit=1)
+        self.assertTrue(rows[0]['invoice'])
+        fake.price_mcp.assert_called_once_with('get_bottle',{'bottle_id':'a'})
 
 
-if __name__ == '__main__':
-    unittest.main()
+if __name__=='__main__': unittest.main()
